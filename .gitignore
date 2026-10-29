@@ -1,0 +1,17 @@
+# segredos e dados locais
+servidor/config.env
+servidor/prompt.md
+servidor/memoria.json
+servidor/conversas/
+servidor/wake_log/
+servidor/resposta.wav
+__pycache__/
+.DS_Store
+
+# firmware
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/sdkconfig.segredos
+firmware/dependencies.lock

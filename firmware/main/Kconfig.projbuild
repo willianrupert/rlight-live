@@ -1,0 +1,96 @@
+menu "RLight"
+
+    config RLIGHT_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+
+    config RLIGHT_WIFI_SENHA
+        string "Wi-Fi senha"
+        default ""
+
+    config RLIGHT_SERVIDOR
+        string "WebSocket do voz_server.py (sem o token)"
+        default "ws://192.168.1.10:8765/dispositivo"
+
+    config RLIGHT_TOKEN
+        string "Token do terminal (RLIGHT_TERMINAL_TOKEN do servidor)"
+        default ""
+
+    config RLIGHT_ID
+        string "Nome deste terminal (vai no histórico)"
+        default "sala"
+
+    config RLIGHT_VOLUME
+        int "Volume do alto-falante (%)"
+        range 5 100
+        default 70
+
+    config RLIGHT_MIC_GANHO_BITS
+        int "Ganho digital do INMP441 (bits a mais; 2 = +12 dB)"
+        range 0 8
+        default 2
+
+    config RLIGHT_MIC_SLOT_DIREITO
+        bool "INMP441 no slot direito (L/R em 3V3)"
+        default n
+
+    config RLIGHT_AEC_FD
+        bool "AEC full-duplex (FD_LOW_COST: linear + não linear; melhor para interromper)"
+        default y
+        help
+            Desligado = AEC_MODE_SR_HIGH_PERF (só linear, o padrão do AFE de palavra
+            de ativação). Use se o FD estragar a sua voz ou a detecção da palavra.
+
+    config RLIGHT_AMP_SD_GPIO
+        int "GPIO ligado ao SD do MAX98357A (-1 = SD solto, amp sempre ligado)"
+        default 18
+
+    config RLIGHT_ECONOMIA_WIFI
+        bool "Wi-Fi em modem sleep enquanto espera a palavra"
+        default y
+
+    config RLIGHT_INA_SHUNT_MOHM
+        int "Shunt do INA226 em mΩ (R100 = 100, R010 = 10)"
+        default 100
+
+    config RLIGHT_BATERIA_CORTE_MV
+        int "Corte seguro: abaixo desta tensão (mV) o terminal dorme"
+        range 3300 3800
+        default 3550
+        help
+            3550 mV ≈ 7 % numa INR18650-M29. O terminal mostra "carregue", dorme 10 min
+            e mede de novo. O HW-465A não tem esse corte tão cedo.
+
+    config RLIGHT_OLED_SH1106
+        bool "OLED é SH1106 (1,3\"); desligado = SSD1306 (0,96\")"
+        default y
+
+    config RLIGHT_LED_GPIO
+        int "GPIO do LED RGB da placa (-1 = sem LED)"
+        default 48
+
+    config RLIGHT_PALAVRA_LUMA
+        bool "Palavra \"Ei, Luma\" (microWakeWord) em vez da WakeNet do ESP-SR"
+        default n
+        help
+            Precisa do modelo treinado no Colab (palavra_luma/) copiado para
+            main/palavra/ei_luma.tflite. Desliga a WakeNet (economiza CPU).
+
+    config RLIGHT_LUMA_LIMIAR
+        int "Limiar da média de probabilidade (0-255; 247 ≈ 0,97)"
+        depends on RLIGHT_PALAVRA_LUMA
+        range 1 255
+        default 247
+
+    config RLIGHT_LUMA_JANELA
+        int "Janela da média (inferências)"
+        depends on RLIGHT_PALAVRA_LUMA
+        range 1 20
+        default 5
+
+    config RLIGHT_LUMA_ARENA
+        int "Tensor arena do modelo (bytes, PSRAM)"
+        depends on RLIGHT_PALAVRA_LUMA
+        default 40000
+
+endmenu

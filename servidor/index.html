@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RLight Live</title>
+<style>
+  :root { --bg:#0b0c0f; --card:#16181d; --fg:#e8e9ec; --dim:#8a8f98; --acc:#4f8cff; --ok:#3ecf8e; --bad:#ff5c5c; --warn:#f5b84f; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 -apple-system,system-ui,sans-serif;
+         display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:24px 16px; }
+  h1 { font-weight:600; letter-spacing:.3em; margin:8px 0 4px; }
+  #status { color:var(--dim); margin-bottom:20px; min-height:1.4em; text-align:center; }
+  #orb { width:140px; height:140px; border-radius:50%; border:none; cursor:pointer; color:#fff; font-size:15px;
+         background:radial-gradient(circle at 35% 30%, #6aa0ff, #2a4fa8 70%); transition:transform .15s; }
+  #orb:active { transform:scale(.96); }
+  #orb.armed { background:radial-gradient(circle at 35% 30%, #ffd27a, #a8742a 70%); }
+  #orb.live { background:radial-gradient(circle at 35% 30%, #5fe0a8, #1d7a52 70%); }
+  #orb.talking { animation:pulse 1s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(62,207,142,.6)} 100%{box-shadow:0 0 0 28px rgba(62,207,142,0)} }
+  #opts { margin:18px 0; color:var(--dim); display:flex; gap:16px; align-items:center; flex-wrap:wrap; justify-content:center; }
+  select { background:var(--card); color:var(--fg); border:1px solid #2a2d34; border-radius:8px; padding:4px 8px; }
+  label { display:flex; gap:6px; align-items:center; cursor:pointer; }
+  #log { width:100%; max-width:680px; background:var(--card); border-radius:14px; padding:14px 16px;
+         height:52vh; overflow-y:auto; }
+  .m { margin:6px 0; white-space:pre-wrap; }
+  .u { color:#9fc1ff; } .t { color:var(--fg); } .x { color:var(--dim); font-size:12.5px; font-family:ui-monospace,monospace; }
+  .e { color:var(--bad); }
+</style>
+</head>
+<body>
+<h1>RLIGHT</h1>
+<div id="status">toque para conversar</div>
+<button id="orb">Falar</button>
+<div id="opts">
+  <label><input type="checkbox" id="wake"> escutar “RLight”</label>
+  <span>voz <select id="voice">
+    <option>Charon</option><option>Puck</option><option>Fenrir</option><option>Orus</option>
+    <option>Kore</option><option>Aoede</option><option selected>Leda</option><option>Zephyr</option>
+  </select></span>
+</div>
+<div id="log"></div>
+
+<script>
+// ---------- ajustes ----------
+const PREROLL_MS = 2500;   // áudio guardado antes da palavra de ativação
+const IDLE_MS = 12000;     // sem fala nem resposta por esse tempo → encerra
+const CHUNK_MS = 50;       // 800 amostras a 16 kHz
+// "RLight" é palavra que o ditado do Chrome não conhece: sai como "r light", "erre lait",
+// "relight", "ar lite"… e muitas vezes o "R" some e sobra só "light". Por isso basta o
+// pedaço "light/lait/lite" (raro em português) — com ou sem algo antes. Ajuste com os
+// dados de wake_log/AAAA-MM-DD.jsonl (o que o Chrome ouviu enquanto esperava).
+const WAKE_RE = /(^|\s)(r|erre|er|ar|re|rei|hair|her|ei|hey|e)?[ -]?(light|lite|laite?|laiti|laitch|laight)s?\b|\b(rlight|relight|realight|reallight|rlite|rlait|relait|relaite|harlight|erlight|arlight|ralight)\b/;
+const ehWake = (txt) => WAKE_RE.test(norm(txt));
+const MAX_RECONNECTS = 5;
+
+const $ = (id) => document.getElementById(id);
+const log = (cls, txt) => { if (cls === 'x' || cls === 'e') remote(cls === 'e' ? 'ERRO' : 'info', txt); const d = document.createElement('div'); d.className = 'm ' + cls; d.textContent = txt;
+  $('log').appendChild(d); $('log').scrollTop = 1e9; return d; };
+const setStatus = (s) => $('status').textContent = s;
+// espelha eventos no servidor (terminal + conversa.log) pra depurar
+let sid = null;   // id da sessão = nome do arquivo em conversas/
+const novoSid = () => new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString()
+  .slice(0, 19).replace(/:/g, '-') + '-' + Math.random().toString(36).slice(2, 6);
+const remote = (tipo, texto) => fetch('/log', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ sid, tipo, texto }) }).catch(() => {});
+const norm = (s) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+
+let cfg, ws = null, micCtx, micStream, outCtx, playHead = 0, sources = [];
+let ready = false;          // setup concluído no socket atual → áudio vai direto
+let wanted = false;         // sessão desejada (falso = encerrada de propósito)
+let armed = false;          // modo palavra de ativação
+let handle = null, reconnects = 0, lastActivity = 0;
+let buffer = [];            // pré-gravação / áudio durante (re)conexão
+let curUser = null, curAsst = null, recog = null;
+let anunciar = null;        // resultado do agente a falar assim que a sessão abrir
+const entregues = new Set();
+const MADRUGADA = (h) => h >= 23 || h < 7;   // sem falar sozinho; vai pra central do HA
+
+// ---------- áudio de entrada: mic -> PCM16 16 kHz (sempre ligado enquanto armado/em sessão) ----------
+const WORKLET = `
+class Cap extends AudioWorkletProcessor {
+  constructor(){ super(); this.buf = new Int16Array(800); this.n = 0; }
+  process(inputs){
+    const ch = inputs[0][0]; if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      const s = Math.max(-1, Math.min(1, ch[i]));
+      this.buf[this.n++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      if (this.n === this.buf.length) { this.port.postMessage(this.buf.slice().buffer); this.n = 0; }
+    }
+    return true;
+  }
+}
+registerProcessor('cap', Cap);`;
+
+function b64(buf) {
+  let s = ''; const b = new Uint8Array(buf);
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+const sendAudio = (buf) => ws.send(JSON.stringify(
+  { realtimeInput: { audio: { data: b64(buf), mimeType: 'audio/pcm;rate=16000' } } }));
+
+function onChunk(buf) {
+  if (ready && ws?.readyState === 1) return sendAudio(buf);
+  buffer.push(buf);
+  // fora de sessão: só a janela de pré-gravação; conectando: guarda tudo (até ~15 s)
+  const max = wanted ? 15000 / CHUNK_MS : PREROLL_MS / CHUNK_MS;
+  while (buffer.length > max) buffer.shift();
+}
+
+async function ensureAudio() {
+  outCtx = outCtx || new AudioContext({ sampleRate: 24000 });
+  if (outCtx.state === 'suspended') await outCtx.resume();
+  if (micCtx) return;
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: {
+    echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+  micCtx = new AudioContext({ sampleRate: 16000 });
+  await micCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' })));
+  const node = new AudioWorkletNode(micCtx, 'cap');
+  node.port.onmessage = (e) => onChunk(e.data);
+  micCtx.createMediaStreamSource(micStream).connect(node);
+}
+
+function releaseMic() {
+  micStream?.getTracks().forEach(t => t.stop()); micCtx?.close(); micCtx = micStream = null; buffer = [];
+}
+
+// ---------- áudio de saída: PCM16 24 kHz -> alto-falante ----------
+function play(b64data) {
+  const bin = atob(b64data), n = bin.length >> 1, f = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let v = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    if (v >= 0x8000) v -= 0x10000;
+    f[i] = v / 0x8000;
+  }
+  const buf = outCtx.createBuffer(1, n, 24000); buf.copyToChannel(f, 0);
+  const src = outCtx.createBufferSource(); src.buffer = buf; src.connect(outCtx.destination);
+  playHead = Math.max(playHead, outCtx.currentTime + 0.03);
+  src.start(playHead); playHead += buf.duration;
+  sources.push(src);
+  src.onended = () => { sources = sources.filter(s => s !== src); lastActivity = Date.now();
+    if (!sources.length) $('orb').classList.remove('talking'); };
+  $('orb').classList.add('talking');
+}
+function stopPlayback() { sources.forEach(s => { try { s.stop(); } catch {} }); sources = []; playHead = 0;
+  $('orb').classList.remove('talking'); }
+
+// ---------- palavra de ativação (Web Speech API do Chrome) ----------
+function startWake() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { log('e', 'este navegador não tem reconhecimento de voz — use o Chrome'); return; }
+  if (recog) return;
+  recog = new SR(); recog.lang = 'pt-BR'; recog.continuous = true; recog.interimResults = true;
+  recog.maxAlternatives = 5;   // a 1ª leitura costuma errar "RLight"; as outras às vezes acertam
+  recog.onresult = (e) => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const alts = [...e.results[i]].map(a => a.transcript.trim());
+      const hit = alts.find(ehWake);
+      if (hit) {
+        wakeLog(true, alts);
+        stopWake(); startSession('palavra', hit); return;
+      }
+      if (e.results[i].isFinal) {
+        wakeLog(false, alts);
+        setStatus(`ouvi: “${alts[0]}” — diga “RLight”`);
+      }
+    }
+  };
+  // o Chrome encerra o reconhecimento sozinho de tempos em tempos: religa na hora
+  recog.onend = () => { recog = null; if (armed && !wanted) startWake(); };
+  recog.onerror = (e) => {
+    if (e.error === 'no-speech' || e.error === 'aborted') return;
+    log('e', 'wake: ' + e.error);
+    if (e.error === 'not-allowed') { armed = $('wake').checked = false; render(); }
+  };
+  try { recog.start(); } catch {}
+}
+// registra o que o Chrome ouviu enquanto esperava a palavra (só local, para ajustar o WAKE_RE)
+const wakeLog = (ativou, alts) => fetch('/wake', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ ativou, alts }) }).catch(() => {});
+function stopWake() { const r = recog; recog = null; try { r?.abort(); } catch {} }
+
+// ---------- sessão Gemini Live ----------
+async function startSession(origem = 'botao', ouvido = '') {
+  if (wanted) return;
+  await ensureAudio();
+  wanted = true; handle = null; reconnects = 0; lastActivity = Date.now();
+  sid = novoSid();
+  if (origem === 'agente') buffer = [];
+  remote('inicio', `origem=${origem} voz=${$('voice').value}` + (ouvido ? ` ouvido="${ouvido}"` : ''));
+  if (ouvido) log('m', `👂 “${ouvido}”`);
+  cfg = await (await fetch('/config')).json();   // relê memórias e horário a cada sessão
+  render(); connect();
+}
+
+function connect() {
+  const sock = new WebSocket('wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=' + encodeURIComponent(cfg.key));
+  ws = sock; ready = false;
+  setStatus(handle ? 'reconectando…' : 'conectando…');
+  let queue = Promise.resolve();
+  sock.onopen = () => sock.send(JSON.stringify({ setup: {
+    model: cfg.model,
+    generationConfig: { responseModalities: ['AUDIO'],
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: $('voice').value } } } },
+    systemInstruction: { parts: [{ text: cfg.system }] },
+    tools: [{ functionDeclarations: cfg.tools }],
+    inputAudioTranscription: {}, outputAudioTranscription: {},
+    sessionResumption: handle ? { handle } : {},
+    contextWindowCompression: { slidingWindow: {} },
+  } }));
+  sock.onmessage = (ev) => { queue = queue.then(async () => {
+    if (sock !== ws) return;
+    const txt = typeof ev.data === 'string' ? ev.data : await ev.data.text();
+    await handle_(JSON.parse(txt));
+  }); };
+  sock.onclose = (ev) => {
+    if (sock !== ws) return;          // socket antigo, já substituído
+    ready = false;
+    if (!wanted) return;
+    if (handle && reconnects < MAX_RECONNECTS) {
+      reconnects++; log('x', `🔄 conexão caiu (${ev.code}) — retomando sessão`); connect();
+    } else {
+      log('e', `sessão encerrada (${ev.code}) ${ev.reason || ''}`); endSession();
+    }
+  };
+}
+
+async function handle_(msg) {
+  if (msg.setupComplete) {
+    ready = true; reconnects = 0;
+    buffer.splice(0).forEach(sendAudio);   // pré-gravação + o que foi dito durante a conexão
+    if (anunciar) { ws.send(JSON.stringify({ realtimeInput: { text: textoAnuncio(anunciar) } }));
+      anunciar = null; lastActivity = Date.now(); }
+    setStatus('ouvindo — pode falar (e interromper)'); render(); return;
+  }
+  if (msg.sessionResumptionUpdate?.resumable && msg.sessionResumptionUpdate.newHandle)
+    handle = msg.sessionResumptionUpdate.newHandle;
+  if (msg.goAway) { log('x', `⏳ servidor pediu troca de conexão (${msg.goAway.timeLeft})`);
+    if (handle) { const old = ws; connect(); setTimeout(() => old.close(), 3000); } }
+  const sc = msg.serverContent;
+  if (sc) {
+    if (sc.interrupted) stopPlayback();
+    for (const p of sc.modelTurn?.parts || []) if (p.inlineData?.data) { play(p.inlineData.data); lastActivity = Date.now(); }
+    if (sc.inputTranscription?.text) { lastActivity = Date.now();
+      if (curAsst) remote('rlight', curAsst.textContent.replace('🤖 ', ''));
+      curAsst = null; curUser = curUser || log('u', '🗣️ '); curUser.textContent += sc.inputTranscription.text; }
+    if (sc.outputTranscription?.text) {
+      if (curUser) remote('voce', curUser.textContent.replace('🗣️ ', ''));
+      curUser = null; curAsst = curAsst || log('t', '🤖 '); curAsst.textContent += sc.outputTranscription.text; }
+    if (sc.turnComplete) {
+      if (curUser) remote('voce', curUser.textContent.replace('🗣️ ', ''));
+      if (curAsst) remote('rlight', curAsst.textContent.replace('🤖 ', ''));
+      curUser = null; curAsst = null; }
+  }
+  if (msg.toolCall) {
+    lastActivity = Date.now();
+    const responses = [];
+    for (const fc of msg.toolCall.functionCalls) {
+      if (fc.name === 'pedir_ao_agente') {
+        // responde na hora (o 3.8 só fala depois da resposta → "vou ver isso");
+        // o diagnóstico chega depois por /eventos e entra na conversa como texto
+        const r = await (await fetch('/agente', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sid, tarefa: fc.args.tarefa }) })).json();
+        log('m', `🧠 agente investigando: ${fc.args.tarefa}`);   // o servidor já registra
+        responses.push({ id: fc.id, name: fc.name, response: r });
+        continue;
+      }
+      log('x', `🔧 ${fc.name} ${JSON.stringify(fc.args)}`);
+      const res = await (await fetch('/tool', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sid, name: fc.name, args: fc.args }) })).json();
+      responses.push({ id: fc.id, name: fc.name, response: res });
+    }
+    if (responses.length) ws?.send(JSON.stringify({ toolResponse: { functionResponses: responses } }));
+    lastActivity = Date.now();
+  }
+  if (msg.error) log('e', JSON.stringify(msg.error));
+}
+
+function endSession(reason) {
+  if (reason) log('x', `💤 ${reason}`);
+  if (curUser) remote('voce', curUser.textContent.replace('🗣️ ', ''));
+  if (curAsst) remote('rlight', curAsst.textContent.replace('🤖 ', ''));
+  if (sid) remote('fim', reason || 'encerrado pelo usuário');
+  sid = null;
+  wanted = false; ready = false; handle = null; stopPlayback();
+  const s = ws; ws = null; try { s?.close(); } catch {}
+  buffer = []; curUser = curAsst = null;
+  if (armed) startWake(); else releaseMic();
+  render();
+}
+
+// inatividade: ninguém falou, nada tocando, nenhuma ferramenta → encerra
+setInterval(() => {
+  if (wanted && ready && !sources.length && Date.now() - lastActivity > IDLE_MS)
+    endSession('encerrado por inatividade');
+}, 1000);
+
+function render() {
+  const o = $('orb'); o.classList.toggle('live', wanted); o.classList.toggle('armed', armed && !wanted);
+  o.textContent = wanted ? 'Encerrar' : 'Falar';
+  if (!wanted) setStatus(armed ? 'diga “RLight” ou toque para conversar' : 'toque para conversar');
+}
+
+$('orb').onclick = async () => {
+  try { if (wanted) endSession(); else { stopWake(); await startSession('botao'); } }
+  catch (e) { log('e', String(e)); endSession(); }
+};
+$('wake').onchange = async (e) => {
+  armed = e.target.checked;
+  if (armed) { try { await ensureAudio(); startWake(); } catch (err) { log('e', String(err)); armed = e.target.checked = false; } }
+  else { stopWake(); if (!wanted) releaseMic(); }
+  render();
+};
+// ---------- resultados do agente em segundo plano ----------
+function textoAnuncio(ev) {
+  const u = cfg?.usuario || 'você';
+  let t = `[Resultado da investigação em segundo plano que ${u} pediu: "${ev.tarefa}"]\n${ev.fala}`;
+  if (ev.proposta) t += `\nProposta: ${JSON.stringify(ev.proposta)}`;
+  return t + `\nConte isso a ${u} agora, de forma natural, começando por "${u}, sobre…".`
+    + (ev.proposta ? ' Depois pergunte se ele quer seguir a proposta.' : '');
+}
+
+async function entregar(ev) {
+  if (entregues.has(ev.job)) return;
+  entregues.add(ev.job);
+  const ack = (via, ok = true) => fetch('/agente/ack', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sid, job: ev.job, via, ok }) });
+  log('m', `🧠 resultado do agente: ${ev.fala}`);
+  if (wanted && ready && ws) {                        // (a) sessão aberta
+    lastActivity = Date.now();
+    ws.send(JSON.stringify({ realtimeInput: { text: textoAnuncio(ev) } }));
+    return ack('sessão aberta');
+  }
+  if (MADRUGADA(new Date().getHours())) return ack('madrugada', false);          // (c)
+  if (!navigator.userActivation?.hasBeenActive) return ack('áudio bloqueado: página sem interação', false);
+  try { anunciar = ev; await startSession('agente'); ack('sessão curta'); }    // (b)
+  catch (e) { anunciar = null; ack('falha ao abrir sessão: ' + e, false); }
+}
+
+(function ouvirEventos() {
+  const es = new EventSource('/eventos');
+  es.onmessage = (e) => { const ev = JSON.parse(e.data); if (ev.tipo === 'agente_resultado') entregar(ev); };
+})();
+
+window.addEventListener('error', (e) => remote('ERRO', e.message));
+window.addEventListener('unhandledrejection', (e) => remote('ERRO', String(e.reason)));
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+dependencies:
+  idf: ">=5.3"
+  espressif/esp-sr: "^2.1.0"
+  espressif/esp_websocket_client: "^1.4.0"
+  espressif/led_strip: "^2.5.0"
+  # "Ei, Luma" (microWakeWord): mesmas versões que o ESPHome fixa
+  espressif/esp-tflite-micro: "1.3.3~1"
+  espressif/esp-nn: "1.1.2"
+  esphome/esp-micro-speech-features: "1.2.3"

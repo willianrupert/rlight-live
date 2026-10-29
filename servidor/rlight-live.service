@@ -1,0 +1,20 @@
+# Exemplo de serviço systemd. Ajuste o caminho e copie para /etc/systemd/system/:
+#   systemctl daemon-reload && systemctl enable --now rlight-live
+[Unit]
+Description=RLight Live (Gemini Live + Home Assistant + terminal ESP32-S3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rlight-live/servidor
+ExecStart=/usr/bin/python3 -u voz_server.py
+# fuso da casa: ids de sessão, "agora" do prompt e horário de silêncio
+Environment=TZ=America/Sao_Paulo
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

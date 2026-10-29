@@ -1,0 +1,265 @@
+# 🎙️ RLight Live
+
+**Assistente de voz em tempo real para o Home Assistant, com Gemini Live e um terminal físico ESP32-S3 que conversa em full-duplex: você fala por cima e ele para na hora, sem se ouvir.**
+
+![ESP32-S3](https://img.shields.io/badge/ESP32--S3-N16R8-orange?logo=espressif)
+![ESP-IDF](https://img.shields.io/badge/ESP--IDF-5.4-red?logo=espressif)
+![ESP-SR](https://img.shields.io/badge/ESP--SR-AEC%20%2B%20VAD%20%2B%20WakeNet-blueviolet)
+![Gemini Live](https://img.shields.io/badge/Gemini-Live%20API-4285F4?logo=googlegemini&logoColor=white)
+![Home Assistant](https://img.shields.io/badge/Home%20Assistant-REST-41BDF5?logo=homeassistant&logoColor=white)
+![Python](https://img.shields.io/badge/Python-só%20stdlib-3776AB?logo=python&logoColor=white)
+![Licença](https://img.shields.io/badge/licen%C3%A7a-MIT-green)
+
+Nada de "OK, comando reconhecido". É uma **conversa falada de verdade**, no estilo do ChatGPT voz: ele responde com voz natural, consulta e aciona a casa pelo Home Assistant, lembra de coisas entre conversas e aceita ser interrompido no meio da frase.
+
+Funciona de dois jeitos, com as mesmas ferramentas, memória e histórico:
+
+| | 🖥️ Página no Chrome | 📟 Terminal ESP32-S3 |
+|---|---|---|
+| Ativação | botão ou "RLight" (ditado do Chrome) | **"Ei, Luma"** no próprio chip (microWakeWord) |
+| Eco | AEC do navegador | **AEC full-duplex do ESP-SR** |
+| Onde roda | qualquer computador com Chrome | na estante, **na bateria** |
+| Extras | transcrição na tela | OLED, bipes, LED, medição de bateria |
+
+---
+
+## ✨ Destaques
+
+- **Full-duplex com interrupção:** o AEC do ESP-SR tira do microfone exatamente as amostras que foram para o alto-falante, então o Gemini não se ouve. Quando você fala por cima, o áudio na fila é descartado em milissegundos.
+- **A chave do Gemini nunca sai do servidor:** o S3 só conversa com o seu servidor, por WebSocket com token.
+- **Servidor em Python puro:** `voz_server.py` usa só a biblioteca padrão. Até o WebSocket (cliente TLS para o Gemini e servidor para o S3) é um `ws_mini.py` de 150 linhas.
+- **Ferramentas de verdade no HA:** busca de entidades por nome ou cômodo, leitura de estado, histórico e ações com lista branca de domínios. Depois de agir, ele relê o estado e diz a verdade se não funcionou.
+- **Memória de longo prazo:** "lembra que eu gosto do ar em 23" vira um fato que entra no prompt das próximas conversas.
+- **Histórico estruturado:** cada conversa vira um `.jsonl`, com falas, ferramentas, argumentos, resultados e tempos. O `conversas.py` lista, busca e aponta problemas.
+- **Agente em segundo plano (opcional):** perguntas que pedem investigação vão para um Claude Code headless, só leitura. Quando termina, o RLight conta o resultado sozinho.
+- **Palavra de ativação em português:** notebook do Colab que treina "Ei, Luma" com amostras sintéticas (Piper LibriTTS, vozes pt-BR e Edge TTS) e negativas parecidas ("Ei, Luna", "pluma"…).
+- **Portátil:** UPS de 2× 18650, INA226 medindo tensão e consumo, sensores no HA, aviso em 20 % e **corte seguro** que põe o terminal para dormir antes de judiar das células.
+
+## 🧭 Arquitetura
+
+```mermaid
+flowchart LR
+    subgraph S3["📟 Terminal ESP32-S3"]
+        MIC["🎤 INMP441"] --> AFE["ESP-SR AFE<br/>AEC full-duplex · VAD<br/>palavra de ativação"]
+        FILA["Fila 2 MB<br/>(PSRAM)"] --> AMP["🔊 MAX98357A"]
+        FILA -. "referência do AEC" .-> AFE
+        INA["INA226"] --> TELA["OLED 1,3&quot;"]
+    end
+    subgraph SRV["🖥️ voz_server.py"]
+        PONTE["dispositivo.py<br/>ponte + reamostragem 24→16 kHz"]
+        TOOLS["Ferramentas HA<br/>memória · histórico"]
+        AG["Agente Claude<br/>(opcional)"]
+    end
+    CHROME["🌐 Página no Chrome"]
+    GEM["☁️ Gemini Live API"]
+    HA["🏠 Home Assistant"]
+
+    AFE -- "PCM 16 kHz" --> PONTE
+    PONTE -- "PCM 16 kHz" --> FILA
+    PONTE <== "WebSocket" ==> GEM
+    CHROME <== "WebSocket" ==> GEM
+    CHROME -- "/tool" --> TOOLS
+    PONTE --> TOOLS
+    TOOLS --> HA
+    AG --> HA
+    INA -. "bateria" .-> PONTE -. "sensores" .-> HA
+```
+
+### 🔄 Uma conversa, do começo ao fim
+
+```mermaid
+sequenceDiagram
+    participant V as Você
+    participant S3 as Terminal S3
+    participant SV as Servidor
+    participant G as Gemini Live
+    participant HA as Home Assistant
+
+    V->>S3: "Ei, Luma"
+    S3-->>V: 🔔 bipe subindo · LED verde
+    S3->>SV: {"tipo":"inicio"} + áudio (já sem eco)
+    SV->>G: setup (prompt, voz, ferramentas) + áudio
+    V->>S3: "liga o ar da sala em 23"
+    G->>SV: toolCall acionar(climate.set_temperature)
+    SV->>HA: POST /api/services/…
+    HA-->>SV: estado novo
+    SV->>G: toolResponse
+    G->>SV: voz 24 kHz
+    SV->>S3: voz 16 kHz
+    S3-->>V: "Pronto, o ar da sala está em 23."
+    V->>S3: (fala por cima)
+    G->>SV: interrupted
+    SV->>S3: {"tipo":"interrompido"}
+    S3-->>V: silêncio imediato, ouve a nova pergunta
+    Note over SV: 12 s sem fala, som ou ferramenta
+    SV->>S3: {"tipo":"fim"}
+    S3-->>V: 🔔 bipe descendo · espera a palavra
+```
+
+## 🧰 Hardware
+
+| Peça | Função |
+|---|---|
+| **ESP32-S3 N16R8** (16 MB flash, 8 MB PSRAM octal) | cérebro do terminal; a PSRAM é obrigatória para o AFE |
+| **INMP441** | microfone I2S |
+| **MAX98357A** (I2S, 3 W) + alto-falante 4 Ω 5 W 2" | saída de voz |
+| **HW-465A 5V** + 2× INR18650 em paralelo | UPS: carrega pela USB-C e entrega 5 V |
+| **INA226** (shunt R100) | tensão das células e consumo *(opcional)* |
+| **OLED 1,3"** I2C (SH1106 ou SSD1306) | estado, bateria e transcrição *(opcional)* |
+| **Botão de inox com LED** (com trava) | liga/desliga |
+
+> O ESP32-C3 não serve: sem PSRAM, ele não roda a palavra de ativação junto com o cancelamento de eco.
+
+## 🔌 Ligações
+
+Fio de silicone 22 AWG soldado, em 5 cores: 🔴 alimentação · ⚫ terra · 🟡 clock · 🔵 canal · 🟢 dados.
+Os vermelhos que **não** são 5 V levam marca: **🔴¹ = 3V3** (o INMP441 queima acima de 3,6 V) e **🔴² = BAT**.
+
+```
+UPS OUT+ ─🔴─ INA226 IN+   INA226 IN− ─🔴─ [botão C → NO] ─🔴─ S3 5V ─🔴─ MAX98357A VIN
+UPS OUT− ─⚫─ S3 GND                        LED do botão: + no NO, − no GND
+INA226 VBS ─🔴²─ + das células (tensão real da bateria, sem passar pelo regulador)
+```
+
+| Módulo | 3V3 🔴¹ | GND ⚫ | 🟡 | 🔵 | 🟢 | Outros |
+|---|---|---|---|---|---|---|
+| **INMP441** → I2S1 | VDD | GND | SCK → **GPIO5** | WS → **GPIO6** | SD → **GPIO7** | L/R em ponte com o GND |
+| **MAX98357A** → I2S0 | (VIN 5 V 🔴) | GND | BCLK → **GPIO15** | LRC → **GPIO16** | DIN → **GPIO17** | SD → **GPIO18** (🔵 marcado), GAIN solto |
+| **INA226** (0x40) | VCC | GND | SCL → **GPIO9** | — | SDA → **GPIO8** | IN+/IN− na saída 5 V, VBS na bateria |
+| **OLED** (0x3C) | VCC | GND | SCL → **GPIO9** | — | SDA → **GPIO8** | mesmo barramento do INA226 |
+
+Pinos evitados: 35–37 (PSRAM octal), 0/3/45/46 (strapping) e 19/20 (USB). O LED RGB da placa (GPIO48) mostra o estado: azul fraco = esperando, verde = conversando, vermelho = sem servidor.
+
+> ⚠️ **Grave e leia o log pela USB-C nativa do S3.** Pela porta do conversor USB-serial ela grava, mas pode ficar presa no modo de gravação (`boot:0x0`).
+
+## ⚡ Energia
+
+| Situação | Consumo (saída 5 V) | Autonomia com 2× 2450 mAh |
+|---|---|---|
+| Esperando a palavra (modo economia) | ~0,7 W | ~18 h |
+| Esperando, sem economia | ~0,9 W | ~15 h |
+| Conversando | 1,5–2 W | — |
+
+- **Modo economia** (automático):
+  - o Wi-Fi fica em *modem sleep* enquanto espera a palavra;
+  - o amplificador é desligado pelo pino SD fora da fala;
+  - a OLED apaga depois de 30 s esperando.
+
+  Dormir de verdade não dá: ouvir a palavra exige a CPU ligada o tempo todo.
+- **Bateria no Home Assistant:** `sensor.luma_<terminal>_bateria` (%), `_bateria_tensao`, `_consumo` (W) e `_corrente_bateria`.
+- **Aviso em 20 %:** vai para a central de notificações do HA.
+- **Corte seguro:** em 3,55 V (≈ 7 %) o terminal mostra *"carregue"*, desliga o amplificador e o INA226 e dorme 10 min. Ao acordar mede de novo: se já estiver carregando, volta ao normal.
+
+## 🚀 Começando
+
+### 1. Servidor
+
+```bash
+git clone https://github.com/willianrupert/rlight-live && cd rlight-live/servidor
+cp config.example.env config.env      # HA_URL, HA_TOKEN, GEMINI_API_KEY, RLIGHT_TERMINAL_TOKEN…
+cp prompt.example.md prompt.md        # personalidade e regras da sua casa
+python3 voz_server.py
+```
+
+- **Página:** abra **http://localhost:8765** no Chrome. O localhost libera o microfone sem HTTPS.
+- **Servidor sempre ligado** (num LXC, Raspberry etc.): use o `rlight-live.service` com `RLIGHT_BIND=0.0.0.0`.
+- **Segurança:** de fora do localhost só o `/dispositivo` responde, e só com o token. O `/config`, que tem a chave do Gemini, e o `/tool` devolvem 403 para a rede.
+
+### 2. Firmware
+
+```bash
+cd firmware
+cat > sdkconfig.segredos <<'EOF'
+CONFIG_RLIGHT_WIFI_SSID="minha-rede"
+CONFIG_RLIGHT_WIFI_SENHA="..."
+CONFIG_RLIGHT_SERVIDOR="ws://192.168.1.10:8765/dispositivo"
+CONFIG_RLIGHT_TOKEN="o mesmo RLIGHT_TERMINAL_TOKEN do servidor"
+EOF
+docker run --rm -v "$PWD":/project -w /project espressif/idf:v5.4.2 idf.py build
+pip3 install esptool
+cd build && python3 -m esptool --chip esp32s3 -p /dev/cu.usbmodem* -b 460800 write-flash "@flash_args"
+```
+
+O Docker só compila: não precisa instalar o ESP-IDF. Ajustes finos ficam em `idf.py menuconfig` → **RLight**:
+- volume e ganho do mic;
+- modo do AEC;
+- GPIOs do SD do amplificador e do LED;
+- shunt do INA226 e tipo da OLED;
+- tensão do corte seguro;
+- palavra "Ei, Luma".
+
+### 3. Testar sem a placa
+
+O `terminal_teste.py` finge ser o S3: manda um WAV 16 kHz em tempo real e grava a resposta.
+
+```bash
+say -v Luciana -o /tmp/f1.aiff "Oi, quantos graus faz lá fora?"
+afconvert -f WAVE -d LEI16@16000 -c 1 /tmp/f1.aiff /tmp/f1.wav
+python3 servidor/terminal_teste.py ws://127.0.0.1:8765 /tmp/f1.wav
+python3 servidor/terminal_teste.py ws://127.0.0.1:8765 /tmp/longa.wav /tmp/para.wav --interromper
+```
+
+## 🗣️ Palavra de ativação "Ei, Luma"
+
+As palavras prontas do ESP-SR são só em inglês e chinês, então o firmware vem com **"Hi ESP"** até você treinar a sua:
+
+1. Abra [`palavra_luma/treinar_ei_luma.ipynb`](palavra_luma/treinar_ei_luma.ipynb) no Colab (GPU T4, ~1–2 h).
+   - **Positivas:** *"hey luma"* em ~900 vozes do Piper LibriTTS-R, que soa quase igual; vozes Piper pt-BR; Edge TTS com velocidade e tom variando.
+   - **Negativas parecidas:** "Ei, Luna", "Ei, Lula", "uma", "pluma"… além das negativas gerais do microWakeWord.
+2. Escolha o limiar com < 0,5 falso positivo por hora (`RLIGHT_LUMA_LIMIAR`).
+3. Copie o `ei_luma.tflite` para `firmware/main/palavra/`, ligue `RLIGHT_PALAVRA_LUMA` e recompile.
+
+Com o "Ei, Luma" a WakeNet é desligada: o microWakeWord ocupa o lugar dela, roda na saída do AFE (já sem eco) e mede o próprio custo de CPU no log. O `luma.cc` segue o componente `micro_wake_word` do ESPHome: mesmo frontend, mesmas operações e mesma escala de features.
+
+Quer outra palavra? Troque as frases no [`gerar_notebook.py`](palavra_luma/gerar_notebook.py).
+
+## 🔧 Ferramentas do assistente
+
+| Ferramenta | O que faz |
+|---|---|
+| `buscar_entidades` | busca por nome, cômodo ou id (sem acento, ranqueada) |
+| `ler_estado` | estado detalhado: temperatura, modos, brilho, quando mudou |
+| `acionar` | chama um serviço do HA (lista branca de domínios) e relê o estado |
+| `historico` | histórico amostrado das últimas N horas |
+| `lembrar` / `esquecer` | memória de longo prazo (`memoria.json`) |
+| `pedir_ao_agente` | *(opcional)* investigação demorada com o Claude Code, só leitura |
+
+## 📡 Protocolo do terminal
+
+WebSocket `ws://<servidor>:8765/dispositivo?token=…`. Texto = JSON, binário = PCM16 mono 16 kHz.
+
+| Direção | Mensagem | Quando |
+|---|---|---|
+| S3 → servidor | `{"tipo":"ola","id":"sala"}` | ao conectar |
+| S3 → servidor | `{"tipo":"inicio","origem":"palavra"}` + binário | palavra detectada |
+| S3 → servidor | `{"tipo":"vad","fala":true}` | mantém a sessão viva enquanto você fala |
+| S3 → servidor | `{"tipo":"bateria","v":3.95,"ma":184,"pct":72}` | a cada 10 s |
+| servidor → S3 | binário | voz do RLight, já em 16 kHz |
+| servidor → S3 | `{"tipo":"interrompido"}` | você falou por cima: esvaziar a fila |
+| servidor → S3 | `{"tipo":"texto","quem":"r","t":"…"}` | transcrição para a OLED |
+| servidor → S3 | `{"tipo":"sessao","origem":"agente"}` | resultado do agente: abrir sessão sem palavra |
+| servidor → S3 | `{"tipo":"fim"}` | inatividade: voltar a esperar a palavra |
+
+## 📁 Estrutura
+
+```
+servidor/       voz_server.py · dispositivo.py (ponte do S3) · ws_mini.py · index.html
+                conversas.py (histórico) · agente_ler.py · terminal_teste.py
+firmware/       ESP-IDF: main.c (áudio, AFE, WebSocket) · tela.c (OLED + INA226)
+                luma.cc (microWakeWord) · Kconfig.projbuild (menuconfig → RLight)
+palavra_luma/   notebook do Colab para treinar "Ei, Luma"
+```
+
+## 🗺️ Status
+
+- [x] Página no Chrome com palavra de ativação, interrupção, memória, histórico e agente
+- [x] Ponte do terminal no servidor, testada ponta a ponta com o terminal falso (ferramentas, interrupção, agente)
+- [x] Firmware: compila no ESP-IDF 5.4 e roda na placa (AFE com AEC full-duplex, Wi-Fi, WebSocket)
+- [x] Bateria no HA, aviso em 20 % e corte seguro
+- [ ] Validar o AEC e a interrupção com o alto-falante montado
+- [ ] Treinar o "Ei, Luma" e medir a CPU junto com o AFE
+- [ ] Gravação pelo Wi-Fi (OTA)
+
+## 📜 Licença
+
+[MIT](LICENSE). Os dados de treino da palavra de ativação baixados pelo notebook têm licenças próprias, e os modelos treinados com eles são para uso pessoal, não comercial.
