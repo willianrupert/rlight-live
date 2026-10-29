@@ -43,7 +43,7 @@ flowchart LR
         MIC["🎤 INMP441"] --> AFE["ESP-SR AFE<br/>AEC full-duplex · VAD<br/>palavra de ativação"]
         FILA["Fila 2 MB<br/>(PSRAM)"] --> AMP["🔊 MAX98357A"]
         FILA -. "referência do AEC" .-> AFE
-        INA["INA226"] --> TELA["OLED 1,3&quot;"]
+        INA["INA226"] --> TELA["OLED 1,3 pol."]
     end
     subgraph SRV["🖥️ voz_server.py"]
         PONTE["dispositivo.py<br/>ponte + reamostragem 24→16 kHz"]
