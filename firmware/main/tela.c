@@ -33,6 +33,9 @@ static int64_t ultimo_evento;
 static float v_bat, ma;
 static int pct = -1;
 static int leituras_baixas;
+static int tomada = -1, carga = -1;
+static volatile int carga_forcada = -1;       // teste pelo servidor: POST /carga
+static volatile bool ler_ja;                  // relê a bateria (e aplica a carga) agora
 
 // ---------- INA226: VBS = tensão das células, shunt = consumo na saída 5 V ----------
 static bool ina_reg(uint8_t reg, uint16_t *v)
@@ -53,6 +56,56 @@ static int soc(float v)   // tensão de circuito aberto → % (NMC, INR18650-M29
             return (int)(t[i][1] + (v - t[i][0]) / (t[i - 1][0] - t[i][0]) * (t[i - 1][1] - t[i][1]) + 0.5f);
     return 0;
 }
+
+// ---------- carga: CE do 4056 (pino 8 levantado) no CONFIG_RLIGHT_CARGA_GPIO ----------
+// Open-drain: CE solto = o pull-up interno do 4056 liga a carga; CE em 0 = parada. Solto, o
+// pino fica em ~3,6 V (o diodo de proteção do ESP segura) e o 4056 ainda lê alto; com 3,3 V
+// forçados ele lê BAIXO (testado em 30/10). Por isso o pino nunca vai a 1 nem tem pull-up.
+#if CONFIG_RLIGHT_CARGA_GPIO >= 0
+#define CARGA CONFIG_RLIGHT_CARGA_GPIO
+static void carga_soltar(void)
+{
+    gpio_set_direction(CARGA, GPIO_MODE_INPUT);
+}
+
+static void controlar_carga(void)
+{
+#if CONFIG_RLIGHT_TOMADA_GPIO >= 0
+    int t = gpio_get_level(CONFIG_RLIGHT_TOMADA_GPIO);   // divisor do furo 5V+: só a fonte
+    carga_soltar();
+#else
+    // com o CE solto o pino só sobe se o 4056 estiver alimentado, ou seja, na tomada
+    carga_soltar();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    int t = gpio_get_level(CARGA);
+#endif
+    if (t != tomada) ESP_LOGI(TAG, "%s", t ? "na tomada" : "na bateria");
+    tomada = t;
+    // v_bat foi lido no estado anterior: carregando para o limite de cima, em repouso
+    // para o de baixo
+    if (!tomada) carga = 1;
+    else if (carga_forcada >= 0) carga = carga_forcada;
+    else if (carga && v_bat * 1000 >= CONFIG_RLIGHT_CARGA_PARA_MV) carga = 0;
+    else if (!carga && v_bat * 1000 <= CONFIG_RLIGHT_CARGA_LIGA_MV) carga = 1;
+    if (!carga) {
+        gpio_set_level(CARGA, 0);
+        gpio_set_direction(CARGA, GPIO_MODE_OUTPUT);
+    }
+}
+
+static void carga_iniciar(void)
+{
+    gpio_hold_dis(CARGA);                              // vinha segurado do sono
+    gpio_config_t c = { .pin_bit_mask = 1ULL << CARGA, .mode = GPIO_MODE_INPUT,
+                        .pull_up_en = GPIO_PULLUP_DISABLE, .pull_down_en = GPIO_PULLDOWN_DISABLE };
+    gpio_config(&c);
+#if CONFIG_RLIGHT_TOMADA_GPIO >= 0
+    c.pin_bit_mask = 1ULL << CONFIG_RLIGHT_TOMADA_GPIO;
+    gpio_config(&c);
+#endif
+    carga = 1;
+}
+#endif
 
 static void oled_ligar(bool on);
 static void desenhar(void);
@@ -85,6 +138,11 @@ static void dormir_bateria_fraca(void)
         gpio_hold_en(CONFIG_RLIGHT_AMP_SD_GPIO);
         gpio_deep_sleep_hold_en();
     }
+#if CONFIG_RLIGHT_CARGA_GPIO >= 0
+    carga_soltar();                                  // dormindo, a carga fica liberada
+    gpio_hold_en(CARGA);
+    gpio_deep_sleep_hold_en();
+#endif
     esp_sleep_enable_timer_wakeup(10ULL * 60 * 1000000);
     esp_deep_sleep_start();
 }
@@ -97,7 +155,10 @@ static void ler_bateria(void)
     ma = (int16_t)sh * 2.5e-3f / (CONFIG_RLIGHT_INA_SHUNT_MOHM / 1000.0f);   // 2,5 µV / R
     pct = soc(v_bat);
     sujo = true;
-    rlight_enviar_bateria(v_bat, ma, pct);
+#if CONFIG_RLIGHT_CARGA_GPIO >= 0
+    controlar_carga();
+#endif
+    rlight_enviar_bateria(v_bat, ma, pct, tomada, tomada == 1 ? carga : -1);
     // 3 leituras seguidas (30 s) abaixo do corte: um pico de som não derruba o terminal
     leituras_baixas = v_bat > 2.5f && v_bat * 1000 < CONFIG_RLIGHT_BATERIA_CORTE_MV ? leituras_baixas + 1 : 0;
     if (leituras_baixas >= 3) dormir_bateria_fraca();
@@ -178,7 +239,8 @@ static void desenhar(void)
         snprintf(l, sizeof(l), "diga \"%s\"", palavra_txt);
         escrever(3, 0, l);
         if (pct >= 0) {
-            snprintf(l, sizeof(l), "bateria %.2f V", v_bat);
+            snprintf(l, sizeof(l), "bateria %.2f V%s", v_bat,
+                     tomada == 1 ? (carga ? " carreg" : " tomada") : "");
             escrever(5, 0, l);
             snprintf(l, sizeof(l), "consumo %.2f W", ma * 5.0f / 1000.0f);
             escrever(6, 0, l);
@@ -209,7 +271,8 @@ static void tarefa_tela(void *arg)
     bool acesa = oled != NULL;
     for (;;) {
         int64_t agora = esp_timer_get_time();
-        if (agora - ultima_bat >= 10 * 1000000LL) {
+        if (ler_ja || agora - ultima_bat >= 10 * 1000000LL) {
+            ler_ja = false;
             ultima_bat = agora;
             ler_bateria();
         }
@@ -266,10 +329,24 @@ void tela_texto(char quem, const char *t)
     evento();
 }
 
+int tela_tomada(void)
+{
+    return tomada;
+}
+
+void tela_forcar_carga(int c)
+{
+    carga_forcada = c;
+    ler_ja = true;
+}
+
 void tela_iniciar(const char *palavra)
 {
     palavra_txt = palavra;
     mtx = xSemaphoreCreateMutex();
+#if CONFIG_RLIGHT_CARGA_GPIO >= 0
+    carga_iniciar();
+#endif
     i2c_master_bus_handle_t bus;
     i2c_master_bus_config_t bc = {
         .i2c_port = I2C_NUM_0, .sda_io_num = I2C_SDA, .scl_io_num = I2C_SCL,

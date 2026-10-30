@@ -69,6 +69,35 @@ menu "RLight"
         int "Shunt do INA226 em mΩ (R100 = 100, R010 = 10)"
         default 100
 
+    config RLIGHT_CARGA_GPIO
+        int "GPIO ligado ao CE do carregador da UPS (-1 = sem controle de carga)"
+        range -1 48
+        default -1
+        help
+            Pino 8 (CE) do 4056 do HW-465A levantado da placa e ligado por fio a este
+            GPIO, em open-drain: solto = o pull-up interno do 4056 carrega; em 0 = carga
+            parada. Na tomada, a bateria fica entre CARGA_LIGA_MV e CARGA_PARA_MV.
+
+    config RLIGHT_TOMADA_GPIO
+        int "GPIO que lê a fonte da UPS (divisor 100k/100k do furo 5V+; -1 = lê pelo CE)"
+        range -1 48
+        default -1
+        help
+            Sem ele, a tomada é detectada soltando o CE e lendo o pino, o que só vale com
+            o GPIO ligado direto no CE. Com o PNP e o pull-up de 100 kΩ no pino 4, o pino 4
+            recebe tensão mesmo sem fonte e o CE sempre lê alto.
+
+    config RLIGHT_CARGA_LIGA_MV
+        int "Na tomada: libera a carga com a bateria em repouso abaixo de (mV)"
+        default 3750
+
+    config RLIGHT_CARGA_PARA_MV
+        int "Na tomada: para a carga quando a tensão carregando chegar a (mV)"
+        default 3950
+        help
+            Carregando, a tensão fica acima da de repouso: 3950 mV assentam em ~3,87 V,
+            uns 60 %.
+
     config RLIGHT_BATERIA_CORTE_MV
         int "Corte seguro: abaixo desta tensão (mV) o terminal dorme"
         range 3300 3800

@@ -138,21 +138,29 @@ Medido no INA226 (corrente das células) com 2× 18650 de ~2450 mAh em paralelo:
 
 | Situação | Consumo | Autonomia |
 |---|---|---|
-| Esperando a palavra (modo economia) | **~97 mA** (~0,33 W na saída 5 V) | **~44 h** |
-| Esperando, sem AEC desligado e sem PM | ~117 mA (~0,38 W) | ~38 h |
+| Esperando a palavra | ~117 mA (~0,38 W na saída 5 V) | ~38 h |
 | Conversando | ~250 mA | — |
 
 - **Modo economia** (automático):
-  - o Wi-Fi fica em *modem sleep* enquanto espera a palavra;
   - o amplificador é desligado pelo pino SD fora da fala;
   - a OLED apaga depois de 30 s esperando;
-  - o AEC fica desligado esperando a palavra (nada toca) e volta antes do bipe (`RLIGHT_ECONOMIA_CPU`);
-  - frequência dinâmica: a CPU desce de 240 para 80 MHz quando as tarefas dormem (`CONFIG_PM_ENABLE`). O PM ocupa ~1 KB de RAM interna, o bastante para a tarefa do WebSocket não ser criada; tirar o RX do Wi-Fi da IRAM (`ESP_WIFI_RX_IRAM_OPT=n`) devolve ~9 KB.
+  - o AEC fica desligado esperando a palavra (nada toca) e volta antes do bipe (`RLIGHT_ECONOMIA_CPU`).
+
+  **Testado e tirado:** a frequência dinâmica (`CONFIG_PM_ENABLE`) e o Wi-Fi em *modem sleep* chegaram a ~97 mA esperando, mas o primeiro travava a fala (sem lock a CPU fica em 80 MHz) e o segundo deixava o que chega do servidor a ~4 KB/s (OTA caía, avisos arrastados). Leve e fluido valeu mais que 20 mA.
 
   Dormir de verdade não dá: ouvir a palavra exige a CPU ligada o tempo todo.
 - **Bateria no Home Assistant:** `sensor.luma_<terminal>_bateria` (%), `_bateria_tensao`, `_consumo` (W) e `_corrente_bateria`.
 - **Aviso em 20 %:** vai para a central de notificações do HA.
 - **Corte seguro:** em 3,55 V (≈ 7 %) o terminal mostra *"carregue"*, desliga o amplificador e o INA226 e dorme 10 min. Ao acordar mede de novo: se já estiver carregando, volta ao normal.
+
+### 🔋 Controle de carga (opcional, mod na UPS)
+
+Com a fonte sempre plugada, o ESP segura a bateria em **~50–60 %**, onde a Li-ion menos envelhece. O carregador do HW-465A é um **"4056D"** (família TP4056), cujo pino 8 (CE) vem soldado no VCC.
+
+- **Mod:** levante o pino 8 da ilha; 100 kΩ do pino 4 ao pino 8; **2N3906** com emissor no pino 8, coletor no GND e base por 10 kΩ ao GPIO (`RLIGHT_CARGA_GPIO`). GPIO em 0 → CE ≈ 0,7 V (para); solto → CE ≈ 3,8 V (carrega).
+- **Por que não ligar o GPIO direto:** o 4056 lê 3,3 V como *baixo*, e o CE solto flutua (o multímetro o derrubava a 0,44 V e a carga parava).
+- **Detecção da tomada:** divisor 100 kΩ/100 kΩ do "5V+" de entrada da UPS a um GPIO (`RLIGHT_TOMADA_GPIO`).
+- **Firmware:** na tomada, libera a carga com a bateria em repouso ≤ 3,75 V e para quando a tensão carregando chega a 3,95 V. O HA ganha `sensor.luma_<terminal>_alimentacao` (`bateria` / `tomada` / `tomada, carregando`), e o terminal fala "Carregando." / "Na bateria." ao plugar ou tirar a fonte (Gemini TTS na voz da conversa, guardado em cache). `POST /carga` (localhost) força a carga para teste.
 
 ## 🚀 Começando
 
@@ -309,6 +317,17 @@ quando o terminal conecta (`RLIGHT_PORTAO_DBFS`, padrão **−100 = desligado**)
 de voz é o VAD do Gemini, com `startOfSpeechSensitivity: START_SENSITIVITY_LOW`
 (`RLIGHT_VAD_INICIO`). No primeiro teste foram 9 min de conversa sem loop. Se o loop voltar,
 suba o portão (ex.: −30) no servidor, sem regravar o firmware.
+
+O servidor mede o atraso de cada interrupção (`✋ interrompido (X s depois do VAD do S3)`):
+2–5 s com `LOW`. Com `START_SENSITIVITY_HIGH` caiu para 0,1–0,3 s, mas sem portão o eco virou
+"fala" e ela se interrompia em loop, repetindo a mesma frase. Interromper rápido depende de o eco
+chegar mais fraco no mic (isolar mic e alto-falante, alinhar o atraso do AEC).
+
+**Mais armadilhas do firmware:**
+- **Conversa caía no meio:** a leitura da bateria ia direto no WebSocket com prazo de 200 ms; ao estourar, o `esp_websocket_client` derruba a conexão. Tudo passa pela fila da tarefa de envio.
+- **"Letra travada" e ruído alto:** o WebSocket entrega pedaços de tamanho ímpar; a reprodução só toca amostras inteiras.
+- **Fala antiga depois de interromper:** depois do `interrompido`, o S3 descarta por 500 ms a voz que ainda vinha no TCP.
+- **Sem servidor:** depois de 2 min sem conexão, o S3 reinicia sozinho. O motivo do último reinício vai junto da versão no `ola` (9 = queda de tensão).
 
 **Outras correções do servidor:**
 - **Busca de luz:** inclui os relés `switch.luz_*` e deixa LEDs de botão por último.

@@ -37,6 +37,7 @@
 #include "esp_http_client.h"
 #include "esp_app_desc.h"
 #include "esp_pm.h"
+#include "esp_system.h"
 #include "tela.h"
 #if CONFIG_RLIGHT_PALAVRA_LUMA
 #include "luma.h"
@@ -71,6 +72,16 @@ static volatile estado_t estado = ESPERANDO;
 static volatile pedido_t pedido = NADA;
 static volatile bool atualizando = false;    // vem do WebSocket, aplicado na tarefa do AFE
 static volatile bool ws_ok;
+static volatile int64_t calado_ate;
+static volatile int64_t wifi_rapido_ate;
+// aviso falado: só começa a tocar com a frase inteira na fila (ou no prazo), sem picotar
+static volatile size_t aviso_bytes;
+static volatile int64_t aviso_ate;     // aviso falado chegando: Wi-Fi sem modem sleep          // depois de uma interrupção, descarta a voz em trânsito
+#if CONFIG_PM_ENABLE
+// com PM a CPU fica em 80 MHz a menos que alguém peça mais: na conversa (AEC + Gemini
+// tocando) isso travava a fala, então a sessão segura 240 MHz até fechar
+static esp_pm_lock_handle_t pm_conversa;
+#endif
 static volatile int portao_dbfs = CONFIG_RLIGHT_BARGEIN_DBFS;   // o servidor pode mudar; <= -100 = sem portão
 static led_strip_handle_t led;
 static EventGroupHandle_t eventos_wifi;
@@ -99,10 +110,12 @@ static void tocar(const void *pcm, size_t n)
     xSemaphoreGive(mtx_play);
 }
 
+static volatile bool zerar_sobra;
 static void calar(void)
 {
     xSemaphoreTake(mtx_play, portMAX_DELAY);
     xStreamBufferReset(fila_play);              // ninguém fica bloqueado nela
+    zerar_sobra = true;
     xSemaphoreGive(mtx_play);
 }
 
@@ -144,14 +157,42 @@ static void tarefa_play(void *arg)
     int16_t buf[PLAY_AMOSTRAS];
     size_t escrito;
     int64_t ultimo_som = 0;
+    uint8_t sobra = 0;
+    bool tem_sobra = false;
     for (;;) {
-        size_t n = xStreamBufferReceive(fila_play, buf, sizeof(buf), 0);
+        // o websocket entrega a voz em pedaços de qualquer tamanho, inclusive ímpar: ler um
+        // número ímpar de bytes desalinha todas as amostras seguintes (ruído alto, "letra
+        // travada" e chiado). Toca só amostras inteiras e guarda o byte que sobrar
+        uint8_t *b = (uint8_t *)buf;
+        size_t n = 0;
+        if (zerar_sobra) {
+            zerar_sobra = false;
+            tem_sobra = false;
+        }
+        if (aviso_bytes) {
+            if (xStreamBufferBytesAvailable(fila_play) < aviso_bytes && esp_timer_get_time() < aviso_ate) {
+                vTaskDelay(pdMS_TO_TICKS(20));   // ainda chegando: espera em silêncio, amp desligado
+                continue;
+            }
+            aviso_bytes = 0;
+        }
+        if (tem_sobra) {
+            b[0] = sobra;
+            n = 1;
+            tem_sobra = false;
+        }
+        n += xStreamBufferReceive(fila_play, b + n, sizeof(buf) - n, 0);
+        if (n & 1) {
+            sobra = b[--n];
+            tem_sobra = true;
+        }
         if (n) {
             ultimo_som = esp_timer_get_time();
             tocou_em = ultimo_som;
             amp(true);
-        } else if (esp_timer_get_time() - ultimo_som > 2000000) {
-            amp(false);
+        } else if (esp_timer_get_time() - ultimo_som > (estado == SESSAO ? 2000000 : 300000)) {
+            amp(false);                          // conversa: 2 s (sem estalo entre frases);
+                                                 // aviso curto: 0,3 s (sem chiado sobrando)
         }
         if (n < sizeof(buf)) memset((uint8_t *)buf + n, 0, sizeof(buf) - n);
         for (int i = 0; i < PLAY_AMOSTRAS; i++) {
@@ -253,6 +294,23 @@ static void enviar_json(const char *fmt, const char *a, const char *b)
     xQueueSend(fila_json, &m, 0);
 }
 
+// Modem sleep (o rádio dorme entre beacons) só esperando a palavra NA BATERIA: nele o que
+// chega do servidor anda a ~4 KB/s (OTA caía, aviso falado travava). Na tomada, numa
+// conversa, num OTA ou com um aviso chegando, o Wi-Fi fica sempre acordado
+static void ajustar_wifi(void)
+{
+#if CONFIG_RLIGHT_ECONOMIA_WIFI
+    bool rapido = estado == SESSAO || atualizando ||
+                  tela_tomada() == 1 || esp_timer_get_time() < wifi_rapido_ate;
+#else
+    bool rapido = true;
+#endif
+    static int atual = -1;
+    if (atual == rapido) return;
+    atual = rapido;
+    esp_wifi_set_ps(rapido ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+}
+
 static void abrir_sessao(const char *origem)
 {
     if (!ws_ok) {                                // sem servidor: avisa e continua esperando
@@ -265,8 +323,11 @@ static void abrir_sessao(const char *origem)
 #if CONFIG_RLIGHT_ECONOMIA_CPU
     afe->enable_aec(afe_dados);                 // religa antes do bipe, que já precisa de AEC
 #endif
+#if CONFIG_PM_ENABLE
+    esp_pm_lock_acquire(pm_conversa);
+#endif
     estado = SESSAO;
-    esp_wifi_set_ps(WIFI_PS_NONE);              // conversa: latência mínima
+    ajustar_wifi();                             // conversa: latência mínima
     BIPE_INICIO();
     if (strcmp(origem, "agente") != 0)
         enviar_json("{\"tipo\":\"inicio\",\"origem\":\"%s\",\"palavra\":\"%s\"}", origem, palavra);
@@ -278,9 +339,10 @@ static void fechar_sessao(void)
 {
     if (estado != SESSAO) return;
     estado = ESPERANDO;
-#if CONFIG_RLIGHT_ECONOMIA_WIFI
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);         // esperando a palavra: rádio dorme entre beacons
+#if CONFIG_PM_ENABLE
+    esp_pm_lock_release(pm_conversa);
 #endif
+    ajustar_wifi();
 #if CONFIG_RLIGHT_PALAVRA_LUMA
     luma_zerar();
 #else
@@ -304,6 +366,7 @@ static void atualizar_firmware(void)
 {
     if (estado == SESSAO) fechar_sessao();
     atualizando = true;
+    ajustar_wifi();                             // em modem sleep o download ia a ~4 KB/s e caía
     calar();
     cor(16, 0, 16);
     tela_texto('r', "Atualizando o firmware...");
@@ -362,6 +425,20 @@ static void confirmar_firmware(void)
     }
 }
 
+// Sem servidor por 2 min (Wi-Fi que não volta, tarefa do websocket que não nasceu por falta
+// de RAM…), reinicia: em 30/10 ele ficou 2 h ligado sem conectar e só voltou desligando
+static int64_t visto_em;
+static void vigia_conexao(void *arg)
+{
+    int64_t agora = esp_timer_get_time();
+    ajustar_wifi();                              // tomada/bateria e fim do aviso
+    if (ws_ok || atualizando) visto_em = agora;
+    else if (agora - visto_em > 120 * 1000000LL) {
+        ESP_LOGE(TAG, "sem servidor há 2 min: reiniciando");
+        esp_restart();
+    }
+}
+
 static void vigia_rollback(void *arg)
 {
     esp_ota_img_states_t st;
@@ -392,8 +469,12 @@ static void tarefa_fetch(void *arg)
         if (res->vad_state == VAD_SPEECH) diag_voz++;
         if (res->data_volume > diag_vol) diag_vol = res->data_volume;
         if (esp_timer_get_time() - diag_t > 3000000) {
-            ESP_LOGI(TAG, "afe: volume máx %.0f dBFS, voz %d%%, eco máx %.0f dBFS (portão %d)",
-                     diag_vol, 100 * diag_voz / diag_n, diag_eco, portao_dbfs);
+            // envio = mic esperando o Wi-Fi; tocar = voz já recebida e ainda não tocada.
+            // Os dois somam atraso na interrupção (32 KB = 1 s)
+            ESP_LOGI(TAG, "afe: volume máx %.0f dBFS, voz %d%%, eco máx %.0f dBFS (portão %d), envio %u KB, tocar %u KB",
+                     diag_vol, 100 * diag_voz / diag_n, diag_eco, portao_dbfs,
+                     (unsigned)(xStreamBufferBytesAvailable(fila_envio) / 1024),
+                     (unsigned)(xStreamBufferBytesAvailable(fila_play) / 1024));
             diag_eco = -200;
             diag_t = esp_timer_get_time();
             diag_n = diag_voz = 0;
@@ -459,8 +540,11 @@ static void ws_evento(void *arg, esp_event_base_t base, int32_t id, void *dados)
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
         ws_ok = true;
-        static char fw[40];
-        snprintf(fw, sizeof(fw), "%s %s", esp_app_get_description()->date, esp_app_get_description()->time);
+        static char fw[64];
+        // motivo do último reinício junto da versão: 9 = brownout (a alimentação afundou),
+        // 4/5/6/7 = pânico/watchdog, 3 = esp_restart, 1 = ligou
+        snprintf(fw, sizeof(fw), "%s %s, reset %d", esp_app_get_description()->date,
+                 esp_app_get_description()->time, (int)esp_reset_reason());
         enviar_json("{\"tipo\":\"ola\",\"id\":\"%s\",\"fw\":\"%s\"}", CONFIG_RLIGHT_ID, fw);
         ESP_LOGI(TAG, "servidor conectado");
         confirmar_firmware();
@@ -475,17 +559,34 @@ static void ws_evento(void *arg, esp_event_base_t base, int32_t id, void *dados)
         break;
     case WEBSOCKET_EVENT_DATA:
         if (d->op_code == 0x2) {                // voz do RLight
-            tocar(d->data_ptr, d->data_len);
+            if (esp_timer_get_time() > calado_ate) tocar(d->data_ptr, d->data_len);
         } else if (d->op_code == 0x1 && d->payload_offset == 0 && d->data_len == d->payload_len) {
             cJSON *j = cJSON_ParseWithLength(d->data_ptr, d->data_len);
             const char *tipo = cJSON_GetStringValue(cJSON_GetObjectItem(j, "tipo"));
             if (!tipo) {
             } else if (!strcmp(tipo, "interrompido")) {
                 calar();                         // você falou por cima: corta na hora
+                // o Gemini manda mais rápido que o tempo real: ainda chega ~1 s da fala
+                // antiga que já estava no TCP (32 KB de janela). Descarta por 500 ms
+                calado_ate = esp_timer_get_time() + 500000;
             } else if (!strcmp(tipo, "fim")) {
                 pedido = FECHAR;
             } else if (!strcmp(tipo, "sessao")) {
                 pedido = ABRIR_AGENTE;           // resultado do agente em segundo plano
+            } else if (!strcmp(tipo, "aviso")) {  // vem voz fora de conversa: acorda o Wi-Fi
+                cJSON *nb = cJSON_GetObjectItem(j, "bytes");
+                if (cJSON_IsNumber(nb) && nb->valueint > 0) {
+                    aviso_ate = esp_timer_get_time() + 3000000;
+                    aviso_bytes = nb->valueint;
+                }
+                wifi_rapido_ate = esp_timer_get_time() + 10000000;
+                ajustar_wifi();
+            } else if (!strcmp(tipo, "carga")) {   // teste: {"tipo":"carga","forcar":0|1|-1}
+                cJSON *f = cJSON_GetObjectItem(j, "forcar");
+                if (cJSON_IsNumber(f)) {
+                    ESP_LOGI(TAG, "carga forçada: %d", f->valueint);
+                    tela_forcar_carga(f->valueint);
+                }
             } else if (!strcmp(tipo, "config")) {  // ajustes vindos do servidor ao conectar
                 cJSON *p = cJSON_GetObjectItem(j, "portao");
                 if (cJSON_IsNumber(p)) {
@@ -539,12 +640,14 @@ static void iniciar_wifi(void)
 #endif
 }
 
-void rlight_enviar_bateria(float v_bat, float ma_saida, int pct)
+void rlight_enviar_bateria(float v_bat, float ma_saida, int pct, int tomada, int carga)
 {
-    char msg[120];
-    snprintf(msg, sizeof(msg), "{\"tipo\":\"bateria\",\"v\":%.3f,\"ma\":%.1f,\"pct\":%d}",
-             v_bat, ma_saida, pct);
-    if (ws_ok) esp_websocket_client_send_text(ws, msg, strlen(msg), pdMS_TO_TICKS(200));
+    // pela fila da tarefa de envio: mandar direto daqui (prazo de 200 ms) disputava o socket
+    // com o áudio e, estourando o prazo, o esp_websocket_client derrubava a conversa
+    msg_json_t m;
+    snprintf(m.txt, sizeof(m.txt), "{\"tipo\":\"bateria\",\"v\":%.3f,\"ma\":%.1f,\"pct\":%d,\"tomada\":%d,\"carga\":%d}",
+             v_bat, ma_saida, pct, tomada, carga);
+    if (ws_ok) xQueueSend(fila_json, &m, 0);
 }
 
 // ---------- I2S ----------
@@ -623,6 +726,7 @@ void app_main(void)
     // CPU desce a 80 MHz quando as tarefas dormem (sem light sleep: o I2S não para)
     esp_pm_config_t pm = { .max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = false };
     ESP_ERROR_CHECK(esp_pm_configure(&pm));
+    esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "conversa", &pm_conversa);
 #endif
     esp_err_t e = nvs_flash_init();
     if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -662,6 +766,10 @@ void app_main(void)
     esp_timer_handle_t t_rollback;
     esp_timer_create(&ta, &t_rollback);
     esp_timer_start_once(t_rollback, 180 * 1000000LL);
+    const esp_timer_create_args_t tc = { .callback = vigia_conexao, .name = "conexao" };
+    esp_timer_handle_t t_conexao;
+    esp_timer_create(&tc, &t_conexao);
+    esp_timer_start_periodic(t_conexao, 10 * 1000000LL);
     iniciar_wifi();
     xEventGroupWaitBits(eventos_wifi, BIT0, pdFALSE, pdTRUE, portMAX_DELAY);
     static char uri[192];
@@ -680,5 +788,6 @@ void app_main(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
     ws = esp_websocket_client_init(&wc);
     esp_websocket_register_events(ws, WEBSOCKET_EVENT_ANY, ws_evento, NULL);
-    esp_websocket_client_start(ws);
+    if (!ws || esp_websocket_client_start(ws) != ESP_OK)
+        ESP_LOGE(TAG, "websocket não iniciou (RAM?): o vigia reinicia em 2 min");
 }

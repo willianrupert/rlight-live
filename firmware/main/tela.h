@@ -11,4 +11,11 @@ void tela_falando(bool falando);
 void tela_texto(char quem, const char *t);   // 'v' = você, 'r' = RLight (texto acumulado)
 
 // no main.c: manda a leitura da bateria para o servidor (a cada 10 s)
-void rlight_enviar_bateria(float v_bat, float ma_saida, int pct);
+// força a carga (1 = liga, 0 = para) ou devolve ao automático (-1); só vale na tomada
+void tela_forcar_carga(int c);
+
+// 1 = na tomada, 0 = na bateria, -1 = não sabe (sem controle de carga)
+int tela_tomada(void);
+
+// tomada/carga: 1, 0 ou -1 (sem controle de carga)
+void rlight_enviar_bateria(float v_bat, float ma_saida, int pct, int tomada, int carga);

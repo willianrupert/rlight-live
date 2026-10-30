@@ -37,8 +37,15 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=48
 # OTA com volta automática: o firmware novo só fica se conectar no servidor (main.c)
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
-# Economia: CPU desce a 80 MHz quando as tarefas dormem. O PM ocupa ~1 KB de RAM interna e
-# isso já não deixava criar a tarefa do WebSocket; o RX do Wi-Fi fora da IRAM devolve ~9 KB
-# (o tráfego de voz é baixo, não faz falta)
-CONFIG_PM_ENABLE=y
+# Sem frequência dinâmica (PM): sem lock a CPU fica em 80 MHz e o AFE com AEC travava a
+# fala. RX do Wi-Fi fora da IRAM: sobram ~24 KB de RAM interna (com ela, 14,5 KB e a
+# conversa caía com transport_poll_write)
 # CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
+
+# Wi-Fi sempre acordado: em modem sleep o que chega do servidor anda a ~4 KB/s (OTA caía,
+# avisos falados arrastados). Custa ~10-20 mA na bateria
+# CONFIG_RLIGHT_ECONOMIA_WIFI is not set
+
+# Controle de carga da UPS (opcional, ver README "Controle de carga"):
+#   CONFIG_RLIGHT_CARGA_GPIO=11    CE do 4056 via PNP 2N3906
+#   CONFIG_RLIGHT_TOMADA_GPIO=10   divisor 100k/100k do 5V de entrada

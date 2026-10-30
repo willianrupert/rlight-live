@@ -166,9 +166,22 @@ def acionar(servico, entity_id, dados=None):
     if dom not in ACTION_DOMAINS:
         return {"erro": f"domínio '{dom}' não é permitido para ação"}
     body = dict(dados or {}, entity_id=entity_id)
+    ids = [entity_id] if isinstance(entity_id, str) else entity_id
+    antes = [ha("GET", f"/api/states/{e}").get("last_updated") for e in ids]
     ha("POST", f"/api/services/{dom}/{svc}", body)
-    time.sleep(0.8)  # deixa o estado assentar antes de reler
-    return {"ok": True, "depois": ler_estado([entity_id] if isinstance(entity_id, str) else entity_id)}
+    # relê até o HA registrar a mudança: Zigbee leva ~0,5 s, mas os ares da LG (nuvem) e os
+    # IR confirmam em alguns segundos; reler cedo demais fazia ela dizer "não ligou"
+    fim = time.time() + 6
+    while True:
+        time.sleep(0.5)
+        agora = [ha("GET", f"/api/states/{e}").get("last_updated") for e in ids]
+        if all(x != y for x, y in zip(agora, antes)) or time.time() > fim:
+            break
+    r = {"ok": True, "depois": ler_estado(ids)}
+    if any(x == y for x, y in zip(agora, antes)):
+        r["obs"] = ("comando enviado, mas o HA não registrou mudança em 6 s: ou já estava assim, ou o "
+                    "aparelho ainda vai confirmar (nuvem/IR); não diga que falhou")
+    return r
 
 
 def historico(entity_id, horas=24):
@@ -370,6 +383,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
         if self.path == "/ota":
             return self._send(200, {"avisados": dispositivo.ota(req.get("terminal"))})
+        if self.path == "/carga":
+            return self._send(200, {"avisados": dispositivo.carga(req.get("forcar", -1), req.get("terminal"))})
         if self.path == "/agente":
             return self._send(200, agente_pedir(sid, req.get("tarefa", "")))
         if self.path == "/agente/ack":

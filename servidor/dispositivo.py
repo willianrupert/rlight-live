@@ -10,7 +10,8 @@ Protocolo (texto = JSON, binário = PCM16 mono 16 kHz little-endian):
                   {"tipo":"inicio","origem":"palavra","palavra":"wn9_alexa"}
                   {"tipo":"vad","fala":true|false}               VAD do AFE
                   {"tipo":"fim","motivo":"…"}                    encerrou no S3
-                  {"tipo":"bateria","v":3.95,"ma":184,"pct":78}  INA226, a cada 10 s
+                  {"tipo":"bateria","v":3.95,"ma":184,"pct":78,  INA226, a cada 10 s
+                   "tomada":1,"carga":0}                         (-1 = sem controle de carga)
                   binário: saída do AFE (já sem eco), só durante a sessão
   servidor → S3   {"tipo":"sessao","origem":"agente"}            abre sessão sem palavra
                   {"tipo":"pronto"}                              Gemini conectado
@@ -18,10 +19,15 @@ Protocolo (texto = JSON, binário = PCM16 mono 16 kHz little-endian):
                   {"tipo":"fim","motivo":"…"}                    voltar a esperar a palavra
                   {"tipo":"texto","quem":"v"|"r","t":"…"}        transcrição p/ a OLED (ASCII)
                   {"tipo":"config","portao":-22}                 ao conectar (ver PORTAO_DBFS)
+                  {"tipo":"carga","forcar":1|0|-1}               teste: liga/para/automático
+                  {"tipo":"aviso","bytes":N}                     vem voz fora de conversa: Wi-Fi acordado, toca com tudo recebido
                   binário: voz do RLight, reamostrada de 24 para 16 kHz (a mesma
                   taxa do mic, para o AEC do S3 usar como referência sem conversão)
 """
 import base64
+import hashlib
+import urllib.request
+from pathlib import Path
 import json
 import operator
 import os
@@ -48,6 +54,10 @@ CHUNK_SAIDA = 3200       # bytes por frame para o S3 (100 ms a 16 kHz)
 BATERIA_HA_S = 30        # publica a bateria no HA no máximo a cada 30 s
 BATERIA_AVISO = 20       # % → aviso na central do HA (uma vez por descarga; rearma acima de 30 %)
 EFICIENCIA_BOOST = 0.85  # HW-465A: bateria 3,7 V → 5 V
+# avisos falados ao plugar/tirar a fonte: gerados uma vez no Gemini TTS (mesma voz da
+# conversa) e guardados já em 16 kHz
+FRASES = Path(os.environ.get("RLIGHT_FRASES", "/var/lib/rlight-live/frases"))
+TTS_MODELO = os.environ.get("RLIGHT_TTS_MODELO", "gemini-3.8-flash-tts")
 
 ctx = None               # preenchido por configurar() (funções do voz_server.py)
 _terminais, _lock = {}, threading.Lock()
@@ -68,11 +78,75 @@ def ascii(t):
     return unicodedata.normalize("NFKD", t).encode("ascii", "ignore").decode()
 
 
+def frase(texto):
+    """PCM 16 kHz de uma frase curta na voz da conversa (cache em FRASES)."""
+    cfg = ctx.config()
+    arq = FRASES / (hashlib.sha1(f"{cfg['voice']}|{texto}".encode()).hexdigest()[:16] + ".pcm")
+    if arq.exists():
+        return arq.read_bytes()
+    corpo = {"contents": [{"parts": [{"text": texto}]}],      # instrução junto ele lê em voz alta
+             "generationConfig": {"responseModalities": ["AUDIO"], "speechConfig": {
+                 "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": cfg["voice"]}}}}}
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{TTS_MODELO}:generateContent?key={cfg['key']}",
+        data=json.dumps(corpo).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        parte = json.load(r)["candidates"][0]["content"]["parts"][0]
+    pcm = Reamostrador().processar(base64.b64decode(parte["inlineData"]["data"]))   # 24 → 16 kHz
+    a = array("h")
+    a.frombytes(pcm)
+    # o TTS termina com ~120 ms de ruído em volume máximo depois de um silêncio: corta
+    # qualquer pedaço final curto (< 300 ms) que venha depois de ≥ 200 ms de silêncio
+    picos = [max(map(abs, a[i:i + 320]), default=0) for i in range(0, len(a), 320)]
+    fim = len(picos)
+    while fim and picos[fim - 1] > 600:
+        fim -= 1
+    quietos = 0
+    while fim - quietos and picos[fim - quietos - 1] <= 600:
+        quietos += 1
+    if len(picos) - fim <= 15 and quietos >= 10:
+        del a[fim * 320:]
+    voz = [i for i, x in enumerate(a) if abs(x) > 600]         # o TTS vem com ~1 s de silêncio
+    if voz:
+        a = a[max(0, voz[0] - 1600):voz[-1] + 3200]            # 100 ms antes, 200 ms depois
+    for i in range(min(320, len(a))):                          # 20 ms de fade nas pontas: sem estalo
+        g = i / 320
+        a[i] = int(a[i] * g)
+        a[-1 - i] = int(a[-1 - i] * g)
+    pcm = a.tobytes()
+    FRASES.mkdir(parents=True, exist_ok=True)
+    arq.write_bytes(pcm)
+    return pcm
+
+
+def avisar_alimentacao(term, tomada, carga):
+    """Plugou ou tirou a fonte: fala no terminal (fora de conversa)."""
+    texto = ("Carregando." if carga == 1 else "Na tomada, a bateria já está boa.") if tomada else "Na bateria."
+    print(f"{time.strftime('%H:%M:%S')}   terminal  🔌 {term.id}: {texto}", flush=True)
+    if term.sessao:
+        return
+    try:
+        pcm = frase(texto)
+    except Exception as e:
+        print(f"{time.strftime('%H:%M:%S')}   terminal  ⚠️ frase {texto!r}: {e}", flush=True)
+        return
+    # na bateria o S3 está em modem sleep: acorda o Wi-Fi antes; e ele só toca com a frase
+    # inteira recebida (bytes), para não picotar
+    term.enviar({"tipo": "aviso", "bytes": len(pcm)})
+    time.sleep(0.5)
+    for i in range(0, len(pcm), CHUNK_SAIDA):
+        term.enviar(pcm[i:i + CHUNK_SAIDA])
+
+
 def publicar_bateria(term, ev):
     """Sensores do terminal no HA (POST /api/states). Somem num restart do HA até a
     próxima leitura (≤ 30 s), o que basta para a automação dos 80 %."""
     v, ma, pct = float(ev.get("v", 0)), float(ev.get("ma", 0)), int(ev.get("pct", -1))
+    tomada, carga = int(ev.get("tomada", -1)), int(ev.get("carga", -1))
     w = 5.0 * ma / 1000
+    # na tomada a UPS alimenta o terminal pela USB e a bateria fica parada (ou carregando
+    # a ~1 A, que o INA226 na saída não vê)
+    i_bat = 0 if tomada == 1 else round(w / max(v, 3.0) / EFICIENCIA_BOOST * 1000) if v else 0
     nome = term.id
     disp = {"terminal": nome}
     sensores = {
@@ -86,12 +160,17 @@ def publicar_bateria(term, ev):
                                                       "state_class": "measurement", "corrente_5v_ma": round(ma),
                                                       "friendly_name": f"Luma {nome} consumo"}),
         f"sensor.luma_{nome}_corrente_bateria": (
-            round(w / max(v, 3.0) / EFICIENCIA_BOOST * 1000) if v else 0,
+            i_bat,
             {"unit_of_measurement": "mA", "device_class": "current", "state_class": "measurement",
-             "estimada": "5 V × corrente da saída ÷ tensão da bateria ÷ 0,85 (só descarga)",
+             "estimada": "5 V × corrente da saída ÷ tensão da bateria ÷ 0,85 (só descarga; 0 na tomada)",
              "friendly_name": f"Luma {nome} corrente da bateria"}),
     }
-    if 0 <= pct <= BATERIA_AVISO and not term.avisou_bateria:
+    if tomada >= 0:
+        sensores[f"sensor.luma_{nome}_alimentacao"] = (
+            ("tomada, carregando" if carga == 1 else "tomada") if tomada else "bateria",
+            {"icon": "mdi:power-plug" if tomada else "mdi:battery",
+             "friendly_name": f"Luma {nome} alimentação"})
+    if 0 <= pct <= BATERIA_AVISO and tomada != 1 and not term.avisou_bateria:
         term.avisou_bateria = True
         try:   # central de notificações do HA, nunca push no celular
             ctx.ha("POST", "/api/services/persistent_notification/create",
@@ -174,6 +253,7 @@ class Sessao:
         self.buffer, self.enc, self.sobra = bytearray(), False, b""
         self.ultimo = self.toca_ate = time.time()
         self.falando, self.cur_user, self.cur_asst = False, "", ""
+        self.fala_em = 0.0
         self.ream = Reamostrador()
         self.cfg = ctx.config()     # relê memórias e horário a cada sessão
         # o prompt.md fala da página; no terminal ele é chamado pela palavra do firmware
@@ -292,6 +372,10 @@ class Sessao:
         sc = msg.get("serverContent")
         if sc:
             if sc.get("interrupted"):
+                # atraso da interrupção: do VAD do S3 (você começou a falar) até o Gemini cortar
+                atraso = time.time() - self.fala_em if self.fala_em else -1
+                print(f"{time.strftime('%H:%M:%S')}   terminal  ✋ interrompido "
+                      f"({atraso:.1f} s depois do VAD do S3)", flush=True)
                 self.toca_ate = time.time()
                 self.ream.reset()
                 self.term.enviar({"tipo": "interrompido"})
@@ -361,6 +445,7 @@ class Terminal:
         self.ws, self.id, self.sessao = ws, endereco, None
         self.bateria_em = 0
         self.avisou_bateria = False
+        self.tomada = None          # última leitura (None = ainda não veio nenhuma)
 
     def enviar(self, msg):
         try:
@@ -394,10 +479,23 @@ class Terminal:
                     self.abrir(ev.get("origem", "palavra"), ev.get("palavra", ""))
                 elif tipo == "vad" and s:
                     s.falando = bool(ev.get("fala"))
+                    if s.falando and time.time() < s.toca_ate:   # falou por cima dela
+                        s.fala_em = time.time()
                     s.ultimo = time.time()
-                elif tipo == "bateria" and time.time() - self.bateria_em >= BATERIA_HA_S:
-                    self.bateria_em = time.time()
-                    threading.Thread(target=publicar_bateria, args=(self, ev), daemon=True).start()
+                elif tipo == "bateria":
+                    t = int(ev.get("tomada", -1))
+                    mudou = t >= 0 and self.tomada is not None and t != self.tomada
+                    if t != self.tomada:
+                        print(f"{time.strftime('%H:%M:%S')}   terminal  🔋 {self.id}: tomada={t} "
+                              f"carga={ev.get('carga')} {ev.get('v')} V", flush=True)
+                    if t >= 0:
+                        self.tomada = t
+                    if mudou:
+                        threading.Thread(target=avisar_alimentacao, daemon=True,
+                                         args=(self, t, int(ev.get("carga", -1)))).start()
+                    if mudou or time.time() - self.bateria_em >= BATERIA_HA_S:
+                        self.bateria_em = time.time()
+                        threading.Thread(target=publicar_bateria, args=(self, ev), daemon=True).start()
                 elif tipo == "ota":
                     r = f"✅ gravado em {ev.get('particao')}, reiniciando" if ev.get("ok") else f"❌ {ev.get('erro')}"
                     print(f"{time.strftime('%H:%M:%S')}   terminal  📦 {self.id} OTA: {r}", flush=True)
@@ -426,6 +524,16 @@ def ota(terminal=None):
     for t in alvos:
         print(f"{time.strftime('%H:%M:%S')}   terminal  📦 {t.id}: OTA pedido", flush=True)
         t.enviar({"tipo": "ota"})
+    return [t.id for t in alvos]
+
+
+def carga(forcar, terminal=None):
+    """Força a carga da UPS do(s) terminal(is): 1 liga, 0 para, -1 volta ao automático."""
+    with _lock:
+        alvos = [t for i, t in _terminais.items() if terminal in (None, "", i)]
+    for t in alvos:
+        print(f"{time.strftime('%H:%M:%S')}   terminal  🔋 {t.id}: carga forçada {forcar}", flush=True)
+        t.enviar({"tipo": "carga", "forcar": int(forcar)})
     return [t.id for t in alvos]
 
 
