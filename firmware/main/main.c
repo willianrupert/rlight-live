@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "freertos/stream_buffer.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -56,7 +57,7 @@ typedef enum { ESPERANDO, SESSAO } estado_t;
 typedef enum { NADA, ABRIR_AGENTE, FECHAR } pedido_t;
 
 static i2s_chan_handle_t rx, tx;
-static StreamBufferHandle_t fila_play, fila_ref;
+static StreamBufferHandle_t fila_play, fila_ref, fila_envio;
 static SemaphoreHandle_t mtx_play;
 static esp_websocket_client_handle_t ws;
 static const esp_afe_sr_iface_t *afe;
@@ -130,6 +131,8 @@ static void amp(bool ligar)
     tela_falando(ligar);
 }
 
+static volatile int64_t tocou_em = 0;     // último bloco com voz no alto-falante
+
 static void tarefa_play(void *arg)
 {
     int16_t buf[PLAY_AMOSTRAS];
@@ -139,12 +142,25 @@ static void tarefa_play(void *arg)
         size_t n = xStreamBufferReceive(fila_play, buf, sizeof(buf), 0);
         if (n) {
             ultimo_som = esp_timer_get_time();
+            tocou_em = ultimo_som;
             amp(true);
         } else if (esp_timer_get_time() - ultimo_som > 2000000) {
             amp(false);
         }
         if (n < sizeof(buf)) memset((uint8_t *)buf + n, 0, sizeof(buf) - n);
-        for (int i = 0; i < PLAY_AMOSTRAS; i++) buf[i] = buf[i] * CONFIG_RLIGHT_VOLUME / 100;
+        for (int i = 0; i < PLAY_AMOSTRAS; i++) {
+            float x = buf[i] * (CONFIG_RLIGHT_VOLUME / 100.0f);
+#if CONFIG_RLIGHT_EQ
+            // alto-falante pequeno: corta < 150 Hz (não reproduz, só distorce) e −4 dB acima de
+            // ~3,5 kHz (agudo de lata); nada é reforçado, então não satura
+            static float l1, l2, ly1, ly2, h1, h2, hy1, hy2;
+            float y = 0.95920315f * x - 1.91840630f * l1 + 0.95920315f * l2 + 1.91674122f * ly1 - 0.92007138f * ly2;
+            l2 = l1; l1 = x; ly2 = ly1; ly1 = y;
+            x = 0.77356908f * y - 0.07469976f * h1 + 0.13399900f * h2 + 0.36196065f * hy1 - 0.19482897f * hy2;
+            h2 = h1; h1 = y; hy2 = hy1; hy1 = x;
+#endif
+            buf[i] = x > 32767 ? 32767 : x < -32768 ? -32768 : (int16_t)x;
+        }
         xStreamBufferSend(fila_ref, buf, sizeof(buf), 0);   // exatamente o que vai pro DAC
         i2s_channel_write(tx, buf, sizeof(buf), &escrito, portMAX_DELAY);   // dá o ritmo
     }
@@ -160,6 +176,11 @@ static void tarefa_feed(void *arg)
     int16_t *feed = heap_caps_malloc(n * canais * sizeof(int16_t), MALLOC_CAP_INTERNAL);
     size_t lido;
     ESP_LOGI(TAG, "feed: %d amostras x %d canais", n, canais);
+    int64_t diag_t = esp_timer_get_time();
+    float diag_soma = 0, diag_pico = 0;
+    int32_t diag_n = 0, diag_zeros = 0, diag_cheios = 0;
+    float x1 = 0, x2 = 0, y1 = 0, y2 = 0;            // passa-alta 100 Hz (Butterworth 2ª ordem)
+    const float ganho = 1 << CONFIG_RLIGHT_MIC_GANHO_BITS;
     for (;;) {
         i2s_channel_read(rx, bruto, n * sizeof(int32_t), &lido, portMAX_DELAY);
         // referência alinhada: não deixa acumular atraso (no máximo ~2 blocos na fila)
@@ -168,20 +189,61 @@ static void tarefa_feed(void *arg)
         size_t r = xStreamBufferReceive(fila_ref, ref, n * sizeof(int16_t), 0);
         if (r < n * sizeof(int16_t)) memset((uint8_t *)ref + r, 0, n * sizeof(int16_t) - r);
         for (int i = 0; i < n; i++) {
-            int32_t v = bruto[i] >> (16 - CONFIG_RLIGHT_MIC_GANHO_BITS);   // 24 bits úteis
-            feed[i * canais] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+            // o INMP441 traz um ronco < 100 Hz (ripple do boost) maior que a voz: corta antes do ganho
+            float x = (bruto[i] >> 8) / 256.0f;       // 24 bits úteis, em escala de 16 bits
+            float y = 0.9726139f * (x - 2 * x1 + x2) + 1.94447766f * y1 - 0.94597794f * y2;
+            x2 = x1; x1 = x; y2 = y1; y1 = y;
+            float v = y * ganho;
+            feed[i * canais] = v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v;
             feed[i * canais + 1] = ref[i];
+            // nível no log a cada 3 s: zeros = sem dado (fio/canal L/R), cheios = SD preso em 1
+            if (bruto[i] == 0) diag_zeros++;
+            if (bruto[i] == -1 || bruto[i] == (int32_t)0xFFFFFF00) diag_cheios++;
+            if (fabsf(v) > diag_pico) diag_pico = fabsf(v);
+            diag_soma += v * v;
         }
+        diag_n += n;
+#ifdef RLIGHT_DUMP_MIC
+        // grava 6 s do mic cru (24 bits) na PSRAM a partir de 5 s do boot e despeja devagar pela serial
+        static int32_t *gravacao = NULL;
+        static int pos = 0;
+        const int total = 16000 * 6;
+        if (!gravacao) gravacao = heap_caps_malloc(total * sizeof(int32_t), MALLOC_CAP_SPIRAM);
+        if (esp_timer_get_time() > 5000000 && pos < total) {
+            for (int i = 0; i < n && pos < total; i++) gravacao[pos++] = bruto[i] >> 8;
+            if (pos == total) {
+                for (int i = 0; i < total; i += 32) {
+                    printf("D:");
+                    for (int k = 0; k < 32; k++) printf("%06x", (unsigned)(gravacao[i + k] & 0xFFFFFF));
+                    printf("\n");
+                    if (i % 512 == 0) vTaskDelay(1);
+                }
+                printf("FIM_DUMP\n");
+            }
+        }
+#endif
         afe->feed(afe_dados, feed);
+        if (esp_timer_get_time() - diag_t > 3000000) {
+            ESP_LOGI(TAG, "mic (filtrado, ganho x%d): rms %d pico %d de 32767, zeros %d%% cheios %d%%",
+                     (int)ganho, (int)sqrtf(diag_soma / diag_n), (int)diag_pico,
+                     (int)(100LL * diag_zeros / diag_n), (int)(100LL * diag_cheios / diag_n));
+            diag_t = esp_timer_get_time();
+            diag_soma = diag_pico = 0;
+            diag_n = diag_zeros = diag_cheios = 0;
+        }
     }
 }
 
 // ---------- sessão ----------
+typedef struct { char txt[160]; } msg_json_t;
+static QueueHandle_t fila_json;
+
+// só enfileira: quem escreve no socket é a tarefa_envio, para a rede lenta nunca travar o AFE
 static void enviar_json(const char *fmt, const char *a, const char *b)
 {
-    char msg[160];
-    snprintf(msg, sizeof(msg), fmt, a, b);
-    if (ws_ok) esp_websocket_client_send_text(ws, msg, strlen(msg), pdMS_TO_TICKS(200));
+    msg_json_t m;
+    snprintf(m.txt, sizeof(m.txt), fmt, a, b);
+    xQueueSend(fila_json, &m, 0);
 }
 
 static void abrir_sessao(const char *origem)
@@ -222,6 +284,11 @@ static void fechar_sessao(void)
 static void tarefa_fetch(void *arg)
 {
     vad_state_t vad_ant = VAD_SILENCE;
+    int64_t diag_t = esp_timer_get_time();
+    int diag_n = 0, diag_voz = 0;
+    float diag_vol = -200, diag_eco = -200;
+    int fortes = 0;
+    int64_t aberto_ate = 0;
     for (;;) {
         afe_fetch_result_t *res = afe->fetch(afe_dados);
         pedido_t p = pedido;
@@ -229,6 +296,18 @@ static void tarefa_fetch(void *arg)
         if (p == FECHAR) fechar_sessao();
         if (p == ABRIR_AGENTE && estado == ESPERANDO) abrir_sessao("agente");
         if (!res || res->ret_value == ESP_FAIL) continue;
+        // saída do AFE no log a cada 3 s: volume máximo e quanto do tempo o VAD achou voz
+        diag_n++;
+        if (res->vad_state == VAD_SPEECH) diag_voz++;
+        if (res->data_volume > diag_vol) diag_vol = res->data_volume;
+        if (esp_timer_get_time() - diag_t > 3000000) {
+            ESP_LOGI(TAG, "afe: volume máx %.0f dBFS, voz %d%%, eco máx %.0f dBFS (portão %d)",
+                     diag_vol, 100 * diag_voz / diag_n, diag_eco, CONFIG_RLIGHT_BARGEIN_DBFS);
+            diag_eco = -200;
+            diag_t = esp_timer_get_time();
+            diag_n = diag_voz = 0;
+            diag_vol = -200;
+        }
 
 #if CONFIG_RLIGHT_PALAVRA_LUMA
         bool detectou = estado == ESPERANDO && luma_processar((const int16_t *)res->data, res->data_size / 2);
@@ -246,8 +325,39 @@ static void tarefa_fetch(void *arg)
             vad_ant = res->vad_state;
             enviar_json("{\"tipo\":\"vad\",\"fala\":%s%s}", vad_ant == VAD_SPEECH ? "true" : "false", "");
         }
-        if (ws_ok)
-            esp_websocket_client_send_bin(ws, (const char *)res->data, res->data_size, pdMS_TO_TICKS(100));
+        // portão de eco: com o alto-falante colado no mic, o AEC sozinho deixa passar a voz do
+        // terminal e o Gemini responde a si mesmo em loop. Enquanto ele fala (e 300 ms depois),
+        // só sobe áudio se o pós-AEC estiver bem acima do eco, ou seja, você falando por cima
+        bool tocando = esp_timer_get_time() - tocou_em < 300000;
+        if (tocando) {
+            if (res->data_volume > diag_eco) diag_eco = res->data_volume;
+            fortes = res->data_volume > CONFIG_RLIGHT_BARGEIN_DBFS ? fortes + 1 : 0;
+            if (fortes >= 3) aberto_ate = esp_timer_get_time() + 600000;
+        }
+        if (tocando && esp_timer_get_time() > aberto_ate) {
+            static int16_t zeros[1024];
+            size_t nz = res->data_size < sizeof(zeros) ? res->data_size : sizeof(zeros);
+            if (xStreamBufferSpacesAvailable(fila_envio) >= nz) xStreamBufferSend(fila_envio, zeros, nz, 0);
+        } else {
+            if (xStreamBufferSpacesAvailable(fila_envio) >= res->data_size)   // só blocos inteiros
+                xStreamBufferSend(fila_envio, res->data, res->data_size, 0);   // cheia (Wi-Fi travado): descarta
+        }
+    }
+}
+
+// ---------- envio do mic ----------
+// Separado do fetch: um engasgo do Wi-Fi não trava o AFE, e o timeout longo evita que o
+// esp_websocket_client derrube a conexão (ele aborta em qualquer escrita que estoure o prazo)
+static void tarefa_envio(void *arg)
+{
+    static uint8_t buf[2048];
+    msg_json_t m;
+    for (;;) {
+        while (xQueueReceive(fila_json, &m, 0) == pdTRUE)
+            if (ws_ok) esp_websocket_client_send_text(ws, m.txt, strlen(m.txt), pdMS_TO_TICKS(3000));
+        size_t n = xStreamBufferReceive(fila_envio, buf, sizeof(buf), pdMS_TO_TICKS(20));
+        if (n && ws_ok && estado == SESSAO)
+            esp_websocket_client_send_bin(ws, (const char *)buf, n, pdMS_TO_TICKS(3000));
     }
 }
 
@@ -391,6 +501,7 @@ static void iniciar_afe(void)
     afe_config_print(cfg);
     afe = esp_afe_handle_from_config(cfg);
     afe_dados = afe->create_from_config(cfg);
+    if (cfg->wakenet_init) afe->set_wakenet_threshold(afe_dados, 1, 0.5);   // padrão do Hi ESP é 0,63: sotaque BR passava raspando
 #if CONFIG_RLIGHT_PALAVRA_LUMA
     if (!luma_iniciar()) {
         ESP_LOGE(TAG, "falha ao carregar ei_luma.tflite");
@@ -423,6 +534,8 @@ void app_main(void)
 
     fila_play = xStreamBufferCreateWithCaps(FILA_PLAY, 1, MALLOC_CAP_SPIRAM);
     fila_ref = xStreamBufferCreate(FILA_REF, 1);
+    fila_json = xQueueCreate(8, sizeof(msg_json_t));
+    fila_envio = xStreamBufferCreateWithCaps(64 * 1024, 1, MALLOC_CAP_SPIRAM);   // ~2 s de mic
     mtx_play = xSemaphoreCreateMutex();
 
     iniciar_i2s();
@@ -431,6 +544,8 @@ void app_main(void)
     xTaskCreatePinnedToCore(tarefa_play, "play", 4096, NULL, 7, NULL, 0);
     xTaskCreatePinnedToCore(tarefa_feed, "feed", 8192, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(tarefa_fetch, "fetch", 8192, NULL, 5, NULL, 1);
+    // pilha na PSRAM: a RAM interna é disputada pelo AFE, Wi-Fi e a tarefa do websocket
+    xTaskCreatePinnedToCoreWithCaps(tarefa_envio, "envio", 4096, NULL, 4, NULL, 1, MALLOC_CAP_SPIRAM);
 
     iniciar_wifi();
     xEventGroupWaitBits(eventos_wifi, BIT0, pdFALSE, pdTRUE, portMAX_DELAY);
@@ -444,6 +559,10 @@ void app_main(void)
         .network_timeout_ms = 10000,
         .ping_interval_sec = 10,
     };
+    ESP_LOGI(TAG, "RAM interna livre: %u (maior bloco %u), PSRAM livre: %u de %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
     ws = esp_websocket_client_init(&wc);
     esp_websocket_register_events(ws, WEBSOCKET_EVENT_ANY, ws_evento, NULL);
     esp_websocket_client_start(ws);

@@ -164,7 +164,7 @@ class Sessao:
         self.term, self.origem, self.anunciar = term, origem, anunciar
         self.sid = novo_sid()
         self.ws, self.ready, self.handle, self.reconexoes = None, False, None, 0
-        self.buffer, self.enc = bytearray(), False
+        self.buffer, self.enc, self.sobra = bytearray(), False, b""
         self.ultimo = self.toca_ate = time.time()
         self.falando, self.cur_user, self.cur_asst = False, "", ""
         self.ream = Reamostrador()
@@ -210,6 +210,14 @@ class Sessao:
         if self.enc or (ws is not None and ws is not self.ws):
             return                       # encerrada de propósito ou socket já substituído
         self.ready = False
+        if "session not found" in motivo and self.handle and self.reconexoes < MAX_RECONEXOES:
+            self.reconexoes += 1
+            # o Gemini descartou a sessão (ex. depois de um 1007): retomar não adianta, abre outra
+            # do zero — perde o contexto da conversa, mas você continua falando sem reativar
+            self.handle = None
+            ctx.registrar(self.sid, "info", texto="🆕 sessão expirou no Gemini — abrindo uma nova")
+            threading.Thread(target=self.conectar, daemon=True).start()
+            return
         if self.handle and self.reconexoes < MAX_RECONEXOES:
             self.reconexoes += 1
             ctx.registrar(self.sid, "info", texto=f"🔄 conexão caiu ({motivo}) — retomando sessão")
@@ -225,6 +233,12 @@ class Sessao:
             pass
 
     def audio(self, pcm):
+        # PCM 16 bits com meia amostra derruba a sessão (1007 invalid argument): realinha
+        pcm = self.sobra + pcm
+        corte = len(pcm) & ~1
+        pcm, self.sobra = pcm[:corte], pcm[corte:]
+        if not pcm:
+            return
         if self.ready:
             return self._g({"realtimeInput": {"audio": {
                 "data": base64.b64encode(pcm).decode(), "mimeType": "audio/pcm;rate=16000"}}})

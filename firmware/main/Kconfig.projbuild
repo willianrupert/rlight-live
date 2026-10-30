@@ -23,12 +23,21 @@ menu "RLight"
     config RLIGHT_VOLUME
         int "Volume do alto-falante (%)"
         range 5 100
-        default 70
+        default 55
+
+    config RLIGHT_BARGEIN_DBFS
+        int "Portão de eco: volume pós-AEC (dBFS) para valer como interrupção enquanto o terminal fala"
+        range -60 0
+        default -22
+
+    config RLIGHT_EQ
+        bool "Equalizar a saída para alto-falante pequeno (corta grave < 150 Hz e um pouco de agudo)"
+        default y
 
     config RLIGHT_MIC_GANHO_BITS
-        int "Ganho digital do INMP441 (bits a mais; 2 = +12 dB)"
+        int "Ganho digital do INMP441 depois do passa-alta (bits; 3 = x8, +18 dB)"
         range 0 8
-        default 2
+        default 3
 
     config RLIGHT_MIC_SLOT_DIREITO
         bool "INMP441 no slot direito (L/R em 3V3)"

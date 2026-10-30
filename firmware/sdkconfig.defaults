@@ -25,3 +25,11 @@ CONFIG_SR_VADN_VADNET1_MEDIUM=y
 #   CONFIG_RLIGHT_WIFI_SENHA="..."
 #   CONFIG_RLIGHT_SERVIDOR="ws://192.168.1.10:8765/dispositivo"
 #   CONFIG_RLIGHT_TOKEN="o mesmo RLIGHT_TERMINAL_TOKEN do servidor"
+
+# rede: ~32 KB/s de mic subindo e ~32 KB/s de voz descendo com sinal fraco; os buffers
+# padrão (5,7 KB ≈ 180 ms) enchiam num engasgo do Wi-Fi e o websocket caía
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+CONFIG_ESP_WIFI_TX_BA_WIN=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=48

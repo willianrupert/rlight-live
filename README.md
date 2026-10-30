@@ -256,9 +256,21 @@ palavra_luma/   notebook do Colab para treinar "Ei, Luma"
 - [x] Ponte do terminal no servidor, testada ponta a ponta com o terminal falso (ferramentas, interrupção, agente)
 - [x] Firmware: compila no ESP-IDF 5.4 e roda na placa (AFE com AEC full-duplex, Wi-Fi, WebSocket)
 - [x] Bateria no HA, aviso em 20 % e corte seguro
-- [ ] Validar o AEC e a interrupção com o alto-falante montado
+- [x] Montado e testado de verdade: palavra, perguntas, controle de luz, agente e conversa longa sem queda
 - [ ] Treinar o "Ei, Luma" e medir a CPU junto com o AFE
 - [ ] Gravação pelo Wi-Fi (OTA)
+
+### 🔧 Lições do primeiro teste com o hardware montado
+
+| Sintoma | Causa | Ajuste |
+|---|---|---|
+| A palavra não disparava | INMP441 entrega voz baixa, e um ronco < 100 Hz (ripple do boost do UPS) era maior que ela | Passa-alta de 100 Hz antes do ganho, ganho ×8 e limiar do WakeNet 0,5 |
+| WebSocket caía a cada ~15 s | Wi-Fi fraco + buffers TCP de 5,7 KB; o `esp_websocket_client` derruba a conexão em qualquer escrita que estoure o prazo | TCP/Wi-Fi com 32 KB e envio numa tarefa separada, com fila de 2 s na PSRAM |
+| Ela se respondia em loop | Eco: o alto-falante satura o mic e o AEC não cancela tudo | Volume 55 % + portão de eco: enquanto fala, só sobe áudio se o pós-AEC passar de −22 dBFS por 100 ms |
+| Som de lata, depois chiado | Alto-falante pequeno; reforçar grave saturava | EQ só de corte (`RLIGHT_EQ`): menos grave < 150 Hz e −4 dB acima de 3,5 kHz |
+| Sessão do Gemini caía (`1007`) | Provável: pedaço de áudio com meia amostra | Só blocos inteiros no firmware, realinhamento no servidor e sessão nova se a retomada falhar |
+
+A RAM interna do S3 fica com ~16 KB livres: coisa nova vai para a PSRAM.
 
 ## 📜 Licença
 
