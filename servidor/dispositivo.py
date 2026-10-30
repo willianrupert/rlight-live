@@ -7,7 +7,7 @@ retoma a sessão se a conexão cair e entrega o resultado do agente em segundo p
 
 Protocolo (texto = JSON, binário = PCM16 mono 16 kHz little-endian):
   S3 → servidor   {"tipo":"ola","id":"sala","fw":"…"}            ao conectar
-                  {"tipo":"inicio","origem":"palavra","palavra":"wn9_hiesp"}
+                  {"tipo":"inicio","origem":"palavra","palavra":"wn9_alexa"}
                   {"tipo":"vad","fala":true|false}               VAD do AFE
                   {"tipo":"fim","motivo":"…"}                    encerrou no S3
                   {"tipo":"bateria","v":3.95,"ma":184,"pct":78}  INA226, a cada 10 s
@@ -171,8 +171,9 @@ class Sessao:
         self.cfg = ctx.config()     # relê memórias e horário a cada sessão
         # o prompt.md fala da página; no terminal ele é chamado pela palavra do firmware
         self.cfg["system"] += ('\n\nAgora você está falando pelo terminal de voz da casa (alto-falante). '
-                               'Lá te chamam por "Ei, Luma" (Luma é o seu apelido); responda normalmente '
-                               'quando ouvir esse nome.')
+                               'Lá a palavra de ativação do aparelho é "Alexa": é só o gatilho, você '
+                               'continua sendo o mesmo assistente (não a Alexa da Amazon); o começo do '
+                               'áudio pode conter ela, não comente isso.')
         ctx.registrar(self.sid, "inicio", texto=f"origem={origem} voz={self.cfg['voice']} "
                       f"terminal={term.id}" + (f' ouvido="{palavra}"' if palavra else ""))
         threading.Thread(target=self.conectar, daemon=True).start()

@@ -16,7 +16,7 @@ Funciona de dois jeitos, com as mesmas ferramentas, memória e histórico:
 
 | | 🖥️ Página no Chrome | 📟 Terminal ESP32-S3 |
 |---|---|---|
-| Ativação | botão ou "RLight" (ditado do Chrome) | **"Ei, Luma"** no próprio chip (microWakeWord) |
+| Ativação | botão ou "RLight" (ditado do Chrome) | **"Alexa"** no próprio chip (WakeNet do ESP-SR) |
 | Eco | AEC do navegador | **AEC full-duplex do ESP-SR** |
 | Onde roda | qualquer computador com Chrome | na estante, **na bateria** |
 | Extras | transcrição na tela | OLED, bipes, LED, medição de bateria |
@@ -32,7 +32,7 @@ Funciona de dois jeitos, com as mesmas ferramentas, memória e histórico:
 - **Memória de longo prazo:** "lembra que eu gosto do ar em 23" vira um fato que entra no prompt das próximas conversas.
 - **Histórico estruturado:** cada conversa vira um `.jsonl`, com falas, ferramentas, argumentos, resultados e tempos. O `conversas.py` lista, busca e aponta problemas.
 - **Agente em segundo plano (opcional):** perguntas que pedem investigação vão para um Claude Code headless, só leitura. Quando termina, o RLight conta o resultado sozinho.
-- **Palavra de ativação em português:** notebook do Colab que treina "Ei, Luma" com amostras sintéticas (Piper LibriTTS, vozes pt-BR e Edge TTS) e negativas parecidas ("Ei, Luna", "pluma"…).
+- **Palavra de ativação de uma palavra só:** "Alexa", modelo pronto do ESP-SR treinado com vozes reais, funciona bem com sotaque brasileiro. Há também um notebook do Colab para treinar uma palavra própria ("Ei, Luma").
 - **Portátil:** UPS de 2× 18650, INA226 medindo tensão e consumo, sensores no HA, aviso em 20 % e **corte seguro** que põe o terminal para dormir antes de judiar das células.
 
 ## 🧭 Arquitetura
@@ -75,7 +75,7 @@ sequenceDiagram
     participant G as Gemini Live
     participant HA as Home Assistant
 
-    V->>S3: "Ei, Luma"
+    V->>S3: "Alexa"
     S3-->>V: 🔔 bipe subindo · LED verde
     S3->>SV: {"tipo":"inicio"} + áudio (já sem eco)
     SV->>G: setup (prompt, voz, ferramentas) + áudio
@@ -186,7 +186,7 @@ O Docker só compila: não precisa instalar o ESP-IDF. Ajustes finos ficam em `i
 - GPIOs do SD do amplificador e do LED;
 - shunt do INA226 e tipo da OLED;
 - tensão do corte seguro;
-- palavra "Ei, Luma".
+- palavra própria "Ei, Luma" (opcional).
 
 **📦 Depois disso, atualize pelo Wi-Fi (OTA)**, com o terminal fechado e na bateria:
 
@@ -211,9 +211,23 @@ python3 servidor/terminal_teste.py ws://127.0.0.1:8765 /tmp/f1.wav
 python3 servidor/terminal_teste.py ws://127.0.0.1:8765 /tmp/longa.wav /tmp/para.wav --interromper
 ```
 
-## 🗣️ Palavra de ativação "Ei, Luma"
+## 🗣️ Palavra de ativação
 
-As palavras prontas do ESP-SR são só em inglês e chinês, então o firmware vem com **"Hi ESP"** até você treinar a sua:
+O firmware acorda com **"Alexa"** (`wn9_alexa`). Entre os modelos prontos do ESP-SR de uma palavra só, é o mais confiável:
+
+- **Três sílabas fortes.** Palavras de 1–2 sílabas disparam à toa ou falham.
+- **Treinado com vozes reais.** Os modelos `*_tts` usam voz sintética e erram mais com sotaque brasileiro.
+- **Funciona no limiar padrão.** O "Hi ESP" precisava de 0,5.
+
+O Gemini é avisado de que "Alexa" é só o gatilho.
+
+- **Não use o `wn10_alexa`.** Ele pede tanta RAM interna que o `esp_wifi_init` falha com `ESP_ERR_NO_MEM`.
+- **Trocar a palavra exige USB.** O modelo fica na partição `model`, que o OTA não grava.
+- **Se tiver um Echo em casa,** escolha outra no `menuconfig` → ESP Speech Recognition (por exemplo, `wn9_jarvis_tts`).
+
+### Palavra própria: "Ei, Luma" (opcional)
+
+Para uma palavra que não está entre as prontas, treine um modelo do microWakeWord. Ele tende a ser menos confiável que a "Alexa", porque o treino é só com voz sintética.
 
 1. Abra [`palavra_luma/treinar_ei_luma.ipynb`](palavra_luma/treinar_ei_luma.ipynb) no Colab (GPU T4, ~1–2 h).
    - **Positivas:** *"hey luma"* em ~900 vozes do Piper LibriTTS-R, que soa quase igual; vozes Piper pt-BR; Edge TTS com velocidade e tom variando.
@@ -259,7 +273,7 @@ servidor/       voz_server.py · dispositivo.py (ponte do S3) · ws_mini.py · i
                 conversas.py (histórico) · agente_ler.py · terminal_teste.py
 firmware/       ESP-IDF: main.c (áudio, AFE, WebSocket) · tela.c (OLED + INA226)
                 luma.cc (microWakeWord) · Kconfig.projbuild (menuconfig → RLight)
-palavra_luma/   notebook do Colab para treinar "Ei, Luma"
+palavra_luma/   notebook do Colab para treinar uma palavra própria ("Ei, Luma")
 ```
 
 ## 🗺️ Status
@@ -269,7 +283,7 @@ palavra_luma/   notebook do Colab para treinar "Ei, Luma"
 - [x] Firmware: compila no ESP-IDF 5.4 e roda na placa (AFE com AEC full-duplex, Wi-Fi, WebSocket)
 - [x] Bateria no HA, aviso em 20 % e corte seguro
 - [x] Montado e testado de verdade: palavra, perguntas, controle de luz, agente e conversa longa sem queda
-- [ ] Treinar o "Ei, Luma" e medir a CPU junto com o AFE
+- [x] Palavra de ativação "Alexa" (uma palavra só, confiável com sotaque BR)
 - [x] Gravação pelo Wi-Fi (OTA) com volta automática
 
 ### 🔧 Lições do primeiro teste com o hardware montado

@@ -589,7 +589,8 @@ static void iniciar_afe(void)
     afe_config_print(cfg);
     afe = esp_afe_handle_from_config(cfg);
     afe_dados = afe->create_from_config(cfg);
-    if (cfg->wakenet_init) afe->set_wakenet_threshold(afe_dados, 1, 0.5);   // padrão do Hi ESP é 0,63: sotaque BR passava raspando
+    // o Hi ESP precisava de limiar 0,5 (padrão 0,63) com sotaque BR; o Alexa usa o padrão do modelo
+    if (cfg->wakenet_init && strstr(palavra, "hiesp")) afe->set_wakenet_threshold(afe_dados, 1, 0.5);
 #if CONFIG_RLIGHT_PALAVRA_LUMA
     if (!luma_iniciar()) {
         ESP_LOGE(TAG, "falha ao carregar ei_luma.tflite");
@@ -628,7 +629,7 @@ void app_main(void)
 
     iniciar_i2s();
     iniciar_afe();
-    tela_iniciar(strcmp(palavra, "ei_luma") ? "Hi ESP" : "Ei, Luma");
+    tela_iniciar(strstr(palavra, "alexa") ? "Alexa" : strstr(palavra, "hiesp") ? "Hi ESP" : "Ei, Luma");
     xTaskCreatePinnedToCore(tarefa_play, "play", 4096, NULL, 7, NULL, 0);
     xTaskCreatePinnedToCore(tarefa_feed, "feed", 8192, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(tarefa_fetch, "fetch", 8192, NULL, 5, NULL, 1);

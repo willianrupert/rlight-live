@@ -15,9 +15,9 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
-# ESP-SR: palavra provisória (as prontas são só inglês/chinês; "Ei, Luma" vem do
-# microWakeWord) + VADNet
-CONFIG_SR_WN_WN9_HIESP=y
+# ESP-SR: palavra "Alexa" (WakeNet 9, treinado com vozes reais: o mais confiável dos
+# prontos de uma palavra só; o WakeNet 10 não cabe na RAM interna junto com o Wi-Fi) + VADNet
+CONFIG_SR_WN_WN9_ALEXA=y
 CONFIG_SR_VADN_VADNET1_MEDIUM=y
 
 # RLight: servidor e token ficam no sdkconfig.segredos (fora do git), ex.:
