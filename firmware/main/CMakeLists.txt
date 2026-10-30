@@ -1,6 +1,6 @@
 set(srcs "main.c" "tela.c")
 set(embed "")
-set(reqs esp_wifi esp_event esp_netif nvs_flash esp_driver_i2s esp_driver_i2c esp_driver_gpio esp_timer json)
+set(reqs esp_wifi esp_event esp_netif nvs_flash esp_driver_i2s esp_driver_i2c esp_driver_gpio esp_timer json app_update esp_http_client esp_app_format)
 # "Ei, Luma" (microWakeWord): precisa do modelo treinado no Colab (../palavra_luma/)
 if(CONFIG_RLIGHT_PALAVRA_LUMA)
     list(APPEND srcs "luma.cc")

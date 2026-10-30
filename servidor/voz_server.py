@@ -52,6 +52,8 @@ PORT = int(os.environ.get("RLIGHT_PORT", 8765))
 # do localhost só o /dispositivo responde (com token): /config tem a chave do Gemini.
 BIND = os.environ.get("RLIGHT_BIND", "127.0.0.1")
 DISP_TOKEN = os.environ.get("RLIGHT_TERMINAL_TOKEN") or None
+# firmware do terminal para o OTA (firmware/ota.sh coloca o .bin aqui)
+FIRMWARE = Path(os.environ.get("RLIGHT_FIRMWARE", "/var/lib/rlight-live/rlight_terminal.bin"))
 
 # Domínios que o assistente pode acionar. Fora disso, só leitura.
 ACTION_DOMAINS = {
@@ -317,6 +319,13 @@ class H(BaseHTTPRequestHandler):
             if not DISP_TOKEN or tok != DISP_TOKEN or self.headers.get("Upgrade", "").lower() != "websocket":
                 return self._send(403, {"erro": "token do terminal inválido"})
             return dispositivo.atender(self)
+        if self.path.startswith("/firmware.bin"):        # OTA do terminal
+            tok = parse_qs(urlsplit(self.path).query).get("token", [""])[0]
+            if not DISP_TOKEN or tok != DISP_TOKEN:
+                return self._send(403, {"erro": "token do terminal inválido"})
+            if not FIRMWARE.exists():
+                return self._send(404, {"erro": f"sem {FIRMWARE}"})
+            return self._send(200, FIRMWARE.read_bytes(), "application/octet-stream")
         if self._de_fora():
             return
         if self.path in ("/", "/index.html"):
@@ -344,6 +353,8 @@ class H(BaseHTTPRequestHandler):
                 f.write(json.dumps(ev, ensure_ascii=False) + "\n")
             print(f"{ev['t']} {'👂 ATIVOU' if ev['ativou'] else '👂 ouviu':>10}  {' | '.join(ev['alts'])}", flush=True)
             return self._send(200, {"ok": True})
+        if self.path == "/ota":
+            return self._send(200, {"avisados": dispositivo.ota(req.get("terminal"))})
         if self.path == "/agente":
             return self._send(200, agente_pedir(sid, req.get("tarefa", "")))
         if self.path == "/agente/ack":

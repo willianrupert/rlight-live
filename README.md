@@ -188,6 +188,18 @@ O Docker só compila: não precisa instalar o ESP-IDF. Ajustes finos ficam em `i
 - tensão do corte seguro;
 - palavra "Ei, Luma".
 
+**📦 Depois disso, atualize pelo Wi-Fi (OTA)**, com o terminal fechado e na bateria:
+
+```bash
+RLIGHT_SSH=usuario@servidor firmware/ota.sh
+```
+
+O script compila e copia o `.bin` para o servidor (`RLIGHT_FIRMWARE`). Depois faz `POST /ota`.
+O terminal baixa de `/firmware.bin?token=…`, grava na outra partição de app e reinicia; 1,6 MB
+leva ~8 s. O firmware novo só fica se conectar no servidor. Se travar ou passar 3 min sem
+servidor, o bootloader volta sozinho ao anterior. Mudar o `partitions.csv`, o bootloader ou os
+modelos do ESP-SR ainda exige a USB.
+
 ### 3. Testar sem a placa
 
 O `terminal_teste.py` finge ser o S3: manda um WAV 16 kHz em tempo real e grava a resposta.
@@ -258,7 +270,7 @@ palavra_luma/   notebook do Colab para treinar "Ei, Luma"
 - [x] Bateria no HA, aviso em 20 % e corte seguro
 - [x] Montado e testado de verdade: palavra, perguntas, controle de luz, agente e conversa longa sem queda
 - [ ] Treinar o "Ei, Luma" e medir a CPU junto com o AFE
-- [ ] Gravação pelo Wi-Fi (OTA)
+- [x] Gravação pelo Wi-Fi (OTA) com volta automática
 
 ### 🔧 Lições do primeiro teste com o hardware montado
 

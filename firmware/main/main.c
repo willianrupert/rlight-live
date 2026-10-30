@@ -33,6 +33,9 @@
 #include "led_strip.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
+#include "esp_ota_ops.h"
+#include "esp_http_client.h"
+#include "esp_app_desc.h"
 #include "tela.h"
 #if CONFIG_RLIGHT_PALAVRA_LUMA
 #include "luma.h"
@@ -54,7 +57,7 @@ static const char *TAG = "rlight";
 #define FILA_REF      (16 * 1024)
 
 typedef enum { ESPERANDO, SESSAO } estado_t;
-typedef enum { NADA, ABRIR_AGENTE, FECHAR } pedido_t;
+typedef enum { NADA, ABRIR_AGENTE, FECHAR, ATUALIZAR } pedido_t;
 
 static i2s_chan_handle_t rx, tx;
 static StreamBufferHandle_t fila_play, fila_ref, fila_envio;
@@ -64,7 +67,8 @@ static const esp_afe_sr_iface_t *afe;
 static esp_afe_sr_data_t *afe_dados;
 static const char *palavra = "?";
 static volatile estado_t estado = ESPERANDO;
-static volatile pedido_t pedido = NADA;    // vem do WebSocket, aplicado na tarefa do AFE
+static volatile pedido_t pedido = NADA;
+static volatile bool atualizando = false;    // vem do WebSocket, aplicado na tarefa do AFE
 static volatile bool ws_ok;
 static led_strip_handle_t led;
 static EventGroupHandle_t eventos_wifi;
@@ -183,6 +187,7 @@ static void tarefa_feed(void *arg)
     const float ganho = 1 << CONFIG_RLIGHT_MIC_GANHO_BITS;
     for (;;) {
         i2s_channel_read(rx, bruto, n * sizeof(int32_t), &lido, portMAX_DELAY);
+        if (atualizando) continue;                // OTA rodando na tarefa do fetch: não enche o AFE
         // referência alinhada: não deixa acumular atraso (no máximo ~2 blocos na fila)
         while (xStreamBufferBytesAvailable(fila_ref) > 3 * n * sizeof(int16_t))
             xStreamBufferReceive(fila_ref, ref, n * sizeof(int16_t), 0);
@@ -281,6 +286,83 @@ static void fechar_sessao(void)
     cor_estado();
 }
 
+// ---------- OTA ----------
+// O servidor manda {"tipo":"ota"} (firmware/ota.sh) e o terminal baixa o .bin do próprio
+// servidor (http://…:8765/firmware.bin?token=…) para a outra partição de app. Roda aqui, na
+// tarefa do fetch, porque gravar flash exige pilha na RAM interna e não sobra RAM para uma
+// tarefa nova. O app novo só vira definitivo depois de conectar no servidor (ver
+// confirmar_firmware); se travar ou não conectar em 3 min, o bootloader volta ao anterior.
+static void atualizar_firmware(void)
+{
+    if (estado == SESSAO) fechar_sessao();
+    atualizando = true;
+    calar();
+    cor(16, 0, 16);
+    tela_texto('r', "Atualizando o firmware...");
+    char url[200];
+    const char *base = CONFIG_RLIGHT_SERVIDOR;                 // ws://host:porta/dispositivo
+    const char *host = strstr(base, "://") ? strstr(base, "://") + 3 : base;
+    int len_host = strcspn(host, "/");
+    snprintf(url, sizeof(url), "http://%.*s/firmware.bin?token=%s", len_host, host, CONFIG_RLIGHT_TOKEN);
+
+    const esp_partition_t *destino = esp_ota_get_next_update_partition(NULL);
+    esp_http_client_config_t hc = { .url = url, .timeout_ms = 15000, .buffer_size = 2048 };
+    esp_http_client_handle_t cli = esp_http_client_init(&hc);
+    esp_ota_handle_t ota = 0;
+    static uint8_t buf[2048];
+    const char *erro = NULL;
+    int total = 0;
+    if (!destino) erro = "sem partição de OTA (grave uma vez pela USB com o partitions.csv novo)";
+    else if (esp_http_client_open(cli, 0) != ESP_OK) erro = "não conectou no servidor";
+    else if (esp_http_client_fetch_headers(cli) < 0 || esp_http_client_get_status_code(cli) != 200)
+        erro = "servidor não entregou o firmware";
+    else if (esp_ota_begin(destino, OTA_WITH_SEQUENTIAL_WRITES, &ota) != ESP_OK) erro = "esp_ota_begin falhou";
+    while (!erro) {
+        int n = esp_http_client_read(cli, (char *)buf, sizeof(buf));
+        if (n < 0) erro = "download interrompido";
+        else if (n == 0) break;
+        else if (esp_ota_write(ota, buf, n) != ESP_OK) erro = "gravação falhou";
+        else if ((total += n) % (256 * 1024) < n) ESP_LOGI(TAG, "OTA: %d KB", total / 1024);
+    }
+    if (!erro && !esp_http_client_is_complete_data_received(cli)) erro = "download incompleto";
+    if (ota && !erro && esp_ota_end(ota) != ESP_OK) erro = "imagem inválida";
+    else if (ota && erro) esp_ota_abort(ota);
+    if (!erro && esp_ota_set_boot_partition(destino) != ESP_OK) erro = "não trocou a partição de boot";
+    esp_http_client_cleanup(cli);
+    if (erro) {
+        ESP_LOGE(TAG, "OTA falhou: %s", erro);
+        enviar_json("{\"tipo\":\"ota\",\"ok\":false,\"erro\":\"%s\"%s}", erro, "");
+        tela_texto('r', erro);
+        BIPE_ERRO();
+        atualizando = false;
+        cor_estado();
+        return;
+    }
+    ESP_LOGI(TAG, "OTA ok: %d bytes em %s, reiniciando", total, destino->label);
+    enviar_json("{\"tipo\":\"ota\",\"ok\":true,\"particao\":\"%s\"%s}", destino->label, "");
+    vTaskDelay(pdMS_TO_TICKS(500));                  // deixa o aviso sair
+    esp_restart();
+}
+
+// primeira conexão com o servidor depois de um OTA: firmware aprovado, cancela o rollback
+static void confirmar_firmware(void)
+{
+    esp_ota_img_states_t st;
+    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI(TAG, "firmware novo confirmado");
+    }
+}
+
+static void vigia_rollback(void *arg)
+{
+    esp_ota_img_states_t st;
+    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGW(TAG, "firmware novo sem servidor há 3 min: voltando ao anterior");
+        esp_ota_mark_app_invalid_rollback_and_reboot();
+    }
+}
+
 static void tarefa_fetch(void *arg)
 {
     vad_state_t vad_ant = VAD_SILENCE;
@@ -295,6 +377,7 @@ static void tarefa_fetch(void *arg)
         pedido = NADA;
         if (p == FECHAR) fechar_sessao();
         if (p == ABRIR_AGENTE && estado == ESPERANDO) abrir_sessao("agente");
+        if (p == ATUALIZAR) atualizar_firmware();
         if (!res || res->ret_value == ESP_FAIL) continue;
         // saída do AFE no log a cada 3 s: volume máximo e quanto do tempo o VAD achou voz
         diag_n++;
@@ -368,8 +451,11 @@ static void ws_evento(void *arg, esp_event_base_t base, int32_t id, void *dados)
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
         ws_ok = true;
-        enviar_json("{\"tipo\":\"ola\",\"id\":\"%s\",\"fw\":\"%s\"}", CONFIG_RLIGHT_ID, "0.1");
+        static char fw[40];
+        snprintf(fw, sizeof(fw), "%s %s", esp_app_get_description()->date, esp_app_get_description()->time);
+        enviar_json("{\"tipo\":\"ola\",\"id\":\"%s\",\"fw\":\"%s\"}", CONFIG_RLIGHT_ID, fw);
         ESP_LOGI(TAG, "servidor conectado");
+        confirmar_firmware();
         cor_estado();
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
@@ -392,6 +478,8 @@ static void ws_evento(void *arg, esp_event_base_t base, int32_t id, void *dados)
                 pedido = FECHAR;
             } else if (!strcmp(tipo, "sessao")) {
                 pedido = ABRIR_AGENTE;           // resultado do agente em segundo plano
+            } else if (!strcmp(tipo, "ota")) {
+                pedido = ATUALIZAR;
             } else if (!strcmp(tipo, "texto")) {  // transcrição para a OLED
                 const char *quem = cJSON_GetStringValue(cJSON_GetObjectItem(j, "quem"));
                 const char *t = cJSON_GetStringValue(cJSON_GetObjectItem(j, "t"));
@@ -547,6 +635,10 @@ void app_main(void)
     // pilha na PSRAM: a RAM interna é disputada pelo AFE, Wi-Fi e a tarefa do websocket
     xTaskCreatePinnedToCoreWithCaps(tarefa_envio, "envio", 4096, NULL, 4, NULL, 1, MALLOC_CAP_SPIRAM);
 
+    const esp_timer_create_args_t ta = { .callback = vigia_rollback, .name = "rollback" };
+    esp_timer_handle_t t_rollback;
+    esp_timer_create(&ta, &t_rollback);
+    esp_timer_start_once(t_rollback, 180 * 1000000LL);
     iniciar_wifi();
     xEventGroupWaitBits(eventos_wifi, BIT0, pdFALSE, pdTRUE, portMAX_DELAY);
     static char uri[192];

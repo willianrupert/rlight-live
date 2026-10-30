@@ -1,5 +1,9 @@
 # Name,   Type, SubType, Offset,  Size
-nvs,      data, nvs,     0x9000,  0x6000,
+# Duas partições de app para o OTA (uma roda, a outra recebe o firmware novo).
+# Mudar esta tabela exige gravar uma vez pela USB.
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
 phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 4M,
-model,    data, spiffs,  ,        8M,
+ota_0,    app,  ota_0,   0x10000, 4M,
+ota_1,    app,  ota_1,   ,        4M,
+model,    data, spiffs,  ,        7M,

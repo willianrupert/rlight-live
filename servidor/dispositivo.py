@@ -387,6 +387,9 @@ class Terminal:
                 elif tipo == "bateria" and time.time() - self.bateria_em >= BATERIA_HA_S:
                     self.bateria_em = time.time()
                     threading.Thread(target=publicar_bateria, args=(self, ev), daemon=True).start()
+                elif tipo == "ota":
+                    r = f"✅ gravado em {ev.get('particao')}, reiniciando" if ev.get("ok") else f"❌ {ev.get('erro')}"
+                    print(f"{time.strftime('%H:%M:%S')}   terminal  📦 {self.id} OTA: {r}", flush=True)
                 elif tipo == "fim" and s:
                     s.encerrar(ev.get("motivo") or "encerrado no terminal", avisar=False)
         except (ws_mini.Fechado, OSError, ValueError) as e:
@@ -403,6 +406,16 @@ class Terminal:
 def atender(handler):
     """GET /dispositivo (já autenticado): faz o upgrade e segura a conexão."""
     Terminal(ws_mini.aceitar(handler), handler.client_address[0]).rodar()
+
+
+def ota(terminal=None):
+    """Manda o(s) terminal(is) baixar o firmware novo de /firmware.bin (firmware/ota.sh)."""
+    with _lock:
+        alvos = [t for i, t in _terminais.items() if terminal in (None, "", i)]
+    for t in alvos:
+        print(f"{time.strftime('%H:%M:%S')}   terminal  📦 {t.id}: OTA pedido", flush=True)
+        t.enviar({"tipo": "ota"})
+    return [t.id for t in alvos]
 
 
 def entregar(j):
