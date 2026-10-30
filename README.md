@@ -134,16 +134,20 @@ Pinos evitados: 35–37 (PSRAM octal), 0/3/45/46 (strapping) e 19/20 (USB). O LE
 
 ## ⚡ Energia
 
-| Situação | Consumo (saída 5 V) | Autonomia com 2× 2450 mAh |
+Medido no INA226 (corrente das células) com 2× 18650 de ~2450 mAh em paralelo:
+
+| Situação | Consumo | Autonomia |
 |---|---|---|
-| Esperando a palavra (modo economia) | ~0,7 W | ~18 h |
-| Esperando, sem economia | ~0,9 W | ~15 h |
-| Conversando | 1,5–2 W | — |
+| Esperando a palavra (modo economia) | **~97 mA** (~0,33 W na saída 5 V) | **~44 h** |
+| Esperando, sem AEC desligado e sem PM | ~117 mA (~0,38 W) | ~38 h |
+| Conversando | ~250 mA | — |
 
 - **Modo economia** (automático):
   - o Wi-Fi fica em *modem sleep* enquanto espera a palavra;
   - o amplificador é desligado pelo pino SD fora da fala;
-  - a OLED apaga depois de 30 s esperando.
+  - a OLED apaga depois de 30 s esperando;
+  - o AEC fica desligado esperando a palavra (nada toca) e volta antes do bipe (`RLIGHT_ECONOMIA_CPU`);
+  - frequência dinâmica: a CPU desce de 240 para 80 MHz quando as tarefas dormem (`CONFIG_PM_ENABLE`). O PM ocupa ~1 KB de RAM interna, o bastante para a tarefa do WebSocket não ser criada; tirar o RX do Wi-Fi da IRAM (`ESP_WIFI_RX_IRAM_OPT=n`) devolve ~9 KB.
 
   Dormir de verdade não dá: ouvir a palavra exige a CPU ligada o tempo todo.
 - **Bateria no Home Assistant:** `sensor.luma_<terminal>_bateria` (%), `_bateria_tensao`, `_consumo` (W) e `_corrente_bateria`.
@@ -285,6 +289,7 @@ palavra_luma/   notebook do Colab para treinar uma palavra própria ("Ei, Luma")
 - [x] Montado e testado de verdade: palavra, perguntas, controle de luz, agente e conversa longa sem queda
 - [x] Palavra de ativação "Alexa" (uma palavra só, confiável com sotaque BR)
 - [x] Gravação pelo Wi-Fi (OTA) com volta automática
+- [x] Modo economia medido (~97 mA esperando, ~44 h) e interrupção sem portão de eco
 
 ### 🔧 Lições do primeiro teste com o hardware montado
 
@@ -292,11 +297,22 @@ palavra_luma/   notebook do Colab para treinar uma palavra própria ("Ei, Luma")
 |---|---|---|
 | A palavra não disparava | INMP441 entrega voz baixa, e um ronco < 100 Hz (ripple do boost do UPS) era maior que ela | Passa-alta de 100 Hz antes do ganho, ganho ×8 e limiar do WakeNet 0,5 |
 | WebSocket caía a cada ~15 s | Wi-Fi fraco + buffers TCP de 5,7 KB; o `esp_websocket_client` derruba a conexão em qualquer escrita que estoure o prazo | TCP/Wi-Fi com 32 KB e envio numa tarefa separada, com fila de 2 s na PSRAM |
-| Ela se respondia em loop | Eco: o alto-falante satura o mic e o AEC não cancela tudo | Volume 55 % + portão de eco: enquanto fala, só sobe áudio se o pós-AEC passar de −22 dBFS por 100 ms |
+| Ela se respondia em loop | Eco: o alto-falante satura o mic e o AEC não cancela tudo | Volume 55 % + portão de eco: enquanto fala, só sobe áudio se o pós-AEC passar de −22 dBFS por 100 ms. Depois o portão saiu (ver abaixo) |
 | Som de lata, depois chiado | Alto-falante pequeno; reforçar grave saturava | EQ só de corte (`RLIGHT_EQ`): menos grave < 150 Hz e −4 dB acima de 3,5 kHz |
 | Sessão do Gemini caía (`1007`) | Provável: pedaço de áudio com meia amostra | Só blocos inteiros no firmware, realinhamento no servidor e sessão nova se a retomada falhar |
 
-A RAM interna do S3 fica com ~16 KB livres: coisa nova vai para a PSRAM.
+A RAM interna do S3 fica com ~23 KB livres: coisa nova vai para a PSRAM.
+
+**Interromper sem gritar:** com o portão de eco, cortar a resposta exigia falar muito alto, e a
+conversa parecia a de uma Alexa comum. Agora o servidor manda `{"tipo":"config","portao":N}`
+quando o terminal conecta (`RLIGHT_PORTAO_DBFS`, padrão **−100 = desligado**), e quem separa eco
+de voz é o VAD do Gemini, com `startOfSpeechSensitivity: START_SENSITIVITY_LOW`
+(`RLIGHT_VAD_INICIO`). No primeiro teste foram 9 min de conversa sem loop. Se o loop voltar,
+suba o portão (ex.: −30) no servidor, sem regravar o firmware.
+
+**Outras correções do servidor:**
+- **Busca de luz:** inclui os relés `switch.luz_*` e deixa LEDs de botão por último.
+- **Horários do HA:** passam para o fuso local (defina `TZ` no serviço), e o agente recebe a hora atual.
 
 ## 📜 Licença
 

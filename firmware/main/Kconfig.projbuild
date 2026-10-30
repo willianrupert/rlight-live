@@ -58,6 +58,13 @@ menu "RLight"
         bool "Wi-Fi em modem sleep enquanto espera a palavra"
         default y
 
+    config RLIGHT_ECONOMIA_CPU
+        bool "AEC desligado enquanto espera a palavra"
+        default y
+        help
+            Esperando a palavra nada toca, então o AEC (a parte mais pesada do AFE) fica
+            desligado e volta antes do bipe de início.
+
     config RLIGHT_INA_SHUNT_MOHM
         int "Shunt do INA226 em mΩ (R100 = 100, R010 = 10)"
         default 100

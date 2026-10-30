@@ -106,12 +106,20 @@ def compact(s, areas):
     return d
 
 
+def _local(iso):
+    """ISO UTC do HA → 'dd/mm HH:MM' no fuso local do servidor (defina TZ no serviço)."""
+    if not iso:
+        return None
+    from datetime import datetime
+    return datetime.fromisoformat(iso).astimezone().strftime("%d/%m %H:%M")
+
+
 def detail(s, areas):
     d = compact(s, areas)
     keep = ("current_temperature", "temperature", "hvac_modes", "fan_mode",
             "brightness", "current_position", "options", "min", "max", "battery_level")
     d.update({k: s["attributes"][k] for k in keep if k in s["attributes"]})
-    d["mudou_em"] = s["last_changed"][:16]
+    d["mudou_em"] = _local(s["last_changed"])
     return d
 
 
@@ -120,14 +128,21 @@ def detail(s, areas):
 def buscar_entidades(consulta, dominio=None, limite=20):
     areas = area_map()
     termos = norm(consulta).split()
+    # muitas luzes são relés (switch.luz_*), não light.*; e "light" também pega LEDs de
+    # botão que não iluminam nada
+    doms = ({dominio, "switch"} if dominio == "light" else {dominio}) if dominio else None
     hits = []
     for s in ha("GET", "/api/states"):
         dom = s["entity_id"].split(".")[0]
-        if dom in HIDDEN_DOMAINS or (dominio and dom != dominio):
+        if dom in HIDDEN_DOMAINS or (doms and dom not in doms):
             continue
         txt = norm(" ".join([s["entity_id"], s["attributes"].get("friendly_name", ""),
                              areas.get(s["entity_id"], "")]))
         score = sum(t in txt for t in termos)
+        if score and dominio == "light":
+            if dom == "switch" and "luz" not in txt:
+                continue
+            score += 0.5 * ("luz" in txt) - 0.5 * any(w in txt for w in ("botao", "backlight"))
         if score:
             hits.append((score, s))
     hits.sort(key=lambda h: -h[0])
@@ -163,7 +178,7 @@ def historico(entity_id, horas=24):
     pts = data[0] if data else []
     if len(pts) > 40:  # amostra pra não estourar contexto
         pts = pts[:: len(pts) // 40 + 1] + [pts[-1]]
-    return {"pontos": [{"t": p.get("last_changed", "")[:16], "v": p["state"]} for p in pts]}
+    return {"pontos": [{"t": _local(p.get("last_changed")), "v": p["state"]} for p in pts]}
 
 
 MEMORIA = HERE / "memoria.json"
@@ -401,6 +416,8 @@ _fila = queue.Queue()
 
 AGENTE_PROMPT = """Você é o agente em segundo plano do RLight Live (assistente de voz da casa
 de {usuario}). Pedido por voz: "{tarefa}"
+Agora são {agora} (horário local do servidor). Os horários que a API do HA devolve
+(last_changed, history, logbook) estão em UTC: converta para o horário local antes de falar.
 
 Use o helper SOMENTE LEITURA do Home Assistant (sem argumentos mostra o uso):
   python3 servidor/agente_ler.py
@@ -446,7 +463,7 @@ def _rodar_claude(tarefa):
            "--allowedTools", "Read", "Grep", "Glob",
            "Bash(python3 servidor/agente_ler.py:*)",
            "--disallowedTools", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"]
-    p = subprocess.run(cmd, input=AGENTE_PROMPT.format(tarefa=tarefa, usuario=USUARIO), cwd=REPO, env=env,
+    p = subprocess.run(cmd, input=AGENTE_PROMPT.format(tarefa=tarefa, usuario=USUARIO, agora=time.strftime("%d/%m %H:%M")), cwd=REPO, env=env,
                        capture_output=True, text=True, timeout=AGENTE_TIMEOUT)
     meta = json.loads(p.stdout or "{}")
     if meta.get("subtype") == "error_max_budget_usd":

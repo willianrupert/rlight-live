@@ -17,6 +17,7 @@ Protocolo (texto = JSON, binário = PCM16 mono 16 kHz little-endian):
                   {"tipo":"interrompido"}                        descartar áudio na fila
                   {"tipo":"fim","motivo":"…"}                    voltar a esperar a palavra
                   {"tipo":"texto","quem":"v"|"r","t":"…"}        transcrição p/ a OLED (ASCII)
+                  {"tipo":"config","portao":-22}                 ao conectar (ver PORTAO_DBFS)
                   binário: voz do RLight, reamostrada de 24 para 16 kHz (a mesma
                   taxa do mic, para o AEC do S3 usar como referência sem conversão)
 """
@@ -31,6 +32,12 @@ import unicodedata
 from array import array
 
 import ws_mini
+
+# Portão de eco do terminal: enquanto ele fala, só sobe o mic se o pós-AEC passar disso
+# (dBFS); -100 desliga e quem separa eco de voz é o VAD do Gemini, com início de fala menos
+# sensível (VAD_INICIO). Firmware antigo ignora e usa o RLIGHT_BARGEIN_DBFS do Kconfig.
+PORTAO_DBFS = int(os.environ.get("RLIGHT_PORTAO_DBFS", "-100"))
+VAD_INICIO = os.environ.get("RLIGHT_VAD_INICIO", "START_SENSITIVITY_LOW")   # "" = padrão do Gemini
 
 GEMINI_URL = ("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage."
               "v1beta.GenerativeService.BidiGenerateContent?key=")
@@ -198,6 +205,8 @@ class Sessao:
             "inputAudioTranscription": {}, "outputAudioTranscription": {},
             "sessionResumption": {"handle": self.handle} if self.handle else {},
             "contextWindowCompression": {"slidingWindow": {}},
+            **({"realtimeInputConfig": {"automaticActivityDetection": {
+                "startOfSpeechSensitivity": VAD_INICIO}}} if VAD_INICIO else {}),
         }}))
         try:
             while True:
@@ -380,6 +389,7 @@ class Terminal:
                     print(f"{time.strftime('%H:%M:%S')}   terminal  🔌 {self.id} conectado (fw {ev.get('fw')})", flush=True)
                     with _lock:
                         _terminais[self.id] = self
+                    self.enviar({"tipo": "config", "portao": PORTAO_DBFS})
                 elif tipo == "inicio":
                     self.abrir(ev.get("origem", "palavra"), ev.get("palavra", ""))
                 elif tipo == "vad" and s:

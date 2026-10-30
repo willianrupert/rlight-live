@@ -36,6 +36,7 @@
 #include "esp_ota_ops.h"
 #include "esp_http_client.h"
 #include "esp_app_desc.h"
+#include "esp_pm.h"
 #include "tela.h"
 #if CONFIG_RLIGHT_PALAVRA_LUMA
 #include "luma.h"
@@ -70,6 +71,7 @@ static volatile estado_t estado = ESPERANDO;
 static volatile pedido_t pedido = NADA;
 static volatile bool atualizando = false;    // vem do WebSocket, aplicado na tarefa do AFE
 static volatile bool ws_ok;
+static volatile int portao_dbfs = CONFIG_RLIGHT_BARGEIN_DBFS;   // o servidor pode mudar; <= -100 = sem portão
 static led_strip_handle_t led;
 static EventGroupHandle_t eventos_wifi;
 
@@ -260,6 +262,9 @@ static void abrir_sessao(const char *origem)
 #if !CONFIG_RLIGHT_PALAVRA_LUMA
     afe->disable_wakenet(afe_dados);
 #endif
+#if CONFIG_RLIGHT_ECONOMIA_CPU
+    afe->enable_aec(afe_dados);                 // religa antes do bipe, que já precisa de AEC
+#endif
     estado = SESSAO;
     esp_wifi_set_ps(WIFI_PS_NONE);              // conversa: latência mínima
     BIPE_INICIO();
@@ -282,6 +287,9 @@ static void fechar_sessao(void)
     afe->enable_wakenet(afe_dados);
 #endif
     BIPE_FIM();
+#if CONFIG_RLIGHT_ECONOMIA_CPU
+    afe->disable_aec(afe_dados);                // esperando nada toca: AEC é CPU à toa
+#endif
     ESP_LOGI(TAG, "sessão encerrada");
     cor_estado();
 }
@@ -385,7 +393,7 @@ static void tarefa_fetch(void *arg)
         if (res->data_volume > diag_vol) diag_vol = res->data_volume;
         if (esp_timer_get_time() - diag_t > 3000000) {
             ESP_LOGI(TAG, "afe: volume máx %.0f dBFS, voz %d%%, eco máx %.0f dBFS (portão %d)",
-                     diag_vol, 100 * diag_voz / diag_n, diag_eco, CONFIG_RLIGHT_BARGEIN_DBFS);
+                     diag_vol, 100 * diag_voz / diag_n, diag_eco, portao_dbfs);
             diag_eco = -200;
             diag_t = esp_timer_get_time();
             diag_n = diag_voz = 0;
@@ -414,10 +422,10 @@ static void tarefa_fetch(void *arg)
         bool tocando = esp_timer_get_time() - tocou_em < 300000;
         if (tocando) {
             if (res->data_volume > diag_eco) diag_eco = res->data_volume;
-            fortes = res->data_volume > CONFIG_RLIGHT_BARGEIN_DBFS ? fortes + 1 : 0;
+            fortes = res->data_volume > portao_dbfs ? fortes + 1 : 0;
             if (fortes >= 3) aberto_ate = esp_timer_get_time() + 600000;
         }
-        if (tocando && esp_timer_get_time() > aberto_ate) {
+        if (tocando && portao_dbfs > -100 && esp_timer_get_time() > aberto_ate) {
             static int16_t zeros[1024];
             size_t nz = res->data_size < sizeof(zeros) ? res->data_size : sizeof(zeros);
             if (xStreamBufferSpacesAvailable(fila_envio) >= nz) xStreamBufferSend(fila_envio, zeros, nz, 0);
@@ -478,6 +486,12 @@ static void ws_evento(void *arg, esp_event_base_t base, int32_t id, void *dados)
                 pedido = FECHAR;
             } else if (!strcmp(tipo, "sessao")) {
                 pedido = ABRIR_AGENTE;           // resultado do agente em segundo plano
+            } else if (!strcmp(tipo, "config")) {  // ajustes vindos do servidor ao conectar
+                cJSON *p = cJSON_GetObjectItem(j, "portao");
+                if (cJSON_IsNumber(p)) {
+                    portao_dbfs = p->valueint;
+                    ESP_LOGI(TAG, "portão de eco: %d dBFS%s", portao_dbfs, portao_dbfs <= -100 ? " (desligado)" : "");
+                }
             } else if (!strcmp(tipo, "ota")) {
                 pedido = ATUALIZAR;
             } else if (!strcmp(tipo, "texto")) {  // transcrição para a OLED
@@ -591,6 +605,9 @@ static void iniciar_afe(void)
     afe_dados = afe->create_from_config(cfg);
     // o Hi ESP precisava de limiar 0,5 (padrão 0,63) com sotaque BR; o Alexa usa o padrão do modelo
     if (cfg->wakenet_init && strstr(palavra, "hiesp")) afe->set_wakenet_threshold(afe_dados, 1, 0.5);
+#if CONFIG_RLIGHT_ECONOMIA_CPU
+    afe->disable_aec(afe_dados);                // começa esperando a palavra
+#endif
 #if CONFIG_RLIGHT_PALAVRA_LUMA
     if (!luma_iniciar()) {
         ESP_LOGE(TAG, "falha ao carregar ei_luma.tflite");
@@ -602,6 +619,11 @@ static void iniciar_afe(void)
 
 void app_main(void)
 {
+#if CONFIG_PM_ENABLE
+    // CPU desce a 80 MHz quando as tarefas dormem (sem light sleep: o I2S não para)
+    esp_pm_config_t pm = { .max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = false };
+    ESP_ERROR_CHECK(esp_pm_configure(&pm));
+#endif
     esp_err_t e = nvs_flash_init();
     if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
